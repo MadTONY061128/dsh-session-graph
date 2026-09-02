@@ -1,0 +1,43 @@
+{
+  "name": "dsh-session-graph",
+  "version": "0.1.0",
+  "description": "Git-graph 风格的项目对话分叉图：branch=会话，commit=一轮用户请求+AI 完成（AI 总结要点）。DSH web profile bundle。",
+  "type": "module",
+  "engines": {
+    "node": "^22.19.0 || >=24.0.0"
+  },
+  "main": "host/index.js",
+  "exports": {
+    ".": "./host/index.js",
+    "./client": "./dist/client.js",
+    "./package.json": "./package.json"
+  },
+  "dsh": {
+    "engines": {
+      "dsh": ">=0.1.1-rc.1"
+    },
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "inject": [
+        "@deepseek-ai/dsh-client-locale",
+        "@deepseek-ai/dsh-client-runtime",
+        "@deepseek-ai/dsh-client-ui-conversation"
+      ],
+      "platform": "web"
+    }
+  },
+  "files": [
+    "host",
+    "dist",
+    "client-src.js",
+    "build.mjs",
+    "cordis.patch.yml",
+    "README.md"
+  ],
+  "scripts": {
+    "build": "node build.mjs"
+  },
+  "license": "MIT"
+}

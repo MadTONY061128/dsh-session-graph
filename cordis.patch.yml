@@ -1,0 +1,12 @@
+# dsh-session-graph bundle patch: inserts the dual-face plugin row into the web
+# profile roster. Applied as a profile bundle layer (`dsh.bundle.patch` in
+# package.json) over dsh-base. Activate with:
+#   dsh plugin --profile web add link:/absolute/path/to/dsh-session-graph
+#
+# The row is a bare plugin by package name: the node half (exports ".") runs
+# in the host process, and the `dsh.client` declaration in package.json makes
+# the browser half (exports "./client", served at /plugins/<id>/client.js)
+# load in the web GUI.
+- insert:
+    - id: ui-session-graph
+      name: 'dsh-session-graph'
