@@ -56,7 +56,7 @@ var ROW_H = 24
 var PAD_X = 8
 var LABEL_H = 2
 var CONTENT_W = 230
-var TIP_STUB = 14
+var TOP_PAD = 14
 var LANE_COLORS = ['#4f8ef7', '#39a97c', '#e3b341', '#b06fd8', '#e56a6a', '#50b8c0', '#f0885e', '#7f6be8']
 function laneColor(i) { return LANE_COLORS[i % LANE_COLORS.length] }
 
@@ -111,23 +111,11 @@ function layoutTree(data, treeId) {
   var laneOf = {}
   ordered.forEach(function (b, i) { laneOf[b.id] = i })
 
-  var keys = []
-  var seen = {}
-  ordered.forEach(function (b) {
-    ;(b.chain || []).forEach(function (k) { if (!seen[k]) { seen[k] = 1; keys.push(k) } })
-  })
   var commitMap = {}
   for (var i = 0; i < ((data && data.commits) || []).length; i++) commitMap[data.commits[i].key] = data.commits[i]
-  keys.sort(function (a, b) {
-    var ca = commitMap[a]
-    var cb = commitMap[b]
-    if (!ca || !cb) return 0
-    return (cb.time - ca.time) || (cb.endSeq - ca.endSeq)
-  })
-  var rowOf = {}
-  keys.forEach(function (k, i) { rowOf[k] = i })
 
-  var geom = []
+  // Per-branch commit inventory (chain = [shared..., own...]).
+  var branchInfo = {}
   ordered.forEach(function (b) {
     var chain = b.chain || []
     var own = b.commitCount || 0
@@ -135,29 +123,102 @@ function layoutTree(data, treeId) {
     var forkKey = null
     if (own > 0) forkKey = chain.length > own ? chain[chain.length - own - 1] : ownKeys[0]
     else forkKey = chain.length > 0 ? chain[chain.length - 1] : null
-    var headKey = own > 0 ? ownKeys[ownKeys.length - 1] : forkKey
+    branchInfo[b.id] = { ownKeys: ownKeys.slice(), forkKey: forkKey, empty: own === 0 }
+  })
+
+  // Row construction: one CELL per element. The root's native commits seed
+  // the rows (newest first). Each child branch inserts its own commits as a
+  // contiguous block DIRECTLY ABOVE its fork commit (and empty branches
+  // insert one tip cell there), so no own commit can ever land below its
+  // junction (time anomalies included) and every cell holds exactly one
+  // element.
+  var rows = [] // { kind: 'commit', key } | { kind: 'tip', branchId }
+  var rowIndex = {} // commit key -> row index (kept in sync while placing)
+  var bumpAfter = function (at) {
+    for (var k in rowIndex) if (rowIndex[k] >= at) rowIndex[k]++
+  }
+  var place = function (branchId) {
+    var info = branchInfo[branchId]
+    if (!info) return
+    var at = info.forkKey !== null && rowIndex[info.forkKey] !== undefined ? rowIndex[info.forkKey] : rows.length
+    var own = info.ownKeys.slice()
+    own.sort(function (a, b) {
+      var ca = commitMap[a]
+      var cb = commitMap[b]
+      if (!ca || !cb) return 0
+      return (cb.time - ca.time) || (cb.endSeq - ca.endSeq)
+    })
+    // oldest first so the final order directly above the junction is
+    // [newest ... oldest, junction]
+    for (var i2 = own.length - 1; i2 >= 0; i2--) {
+      rows.splice(at, 0, { kind: 'commit', key: own[i2] })
+      bumpAfter(at)
+      rowIndex[own[i2]] = at
+    }
+    if (info.empty && info.forkKey !== null) {
+      rows.splice(at, 0, { kind: 'tip', branchId: branchId })
+      bumpAfter(at)
+    }
+  }
+  ordered.forEach(function (b) {
+    if (b.parentId === null) {
+      var rootOwn = branchInfo[b.id].ownKeys.slice()
+      rootOwn.sort(function (a, b2) {
+        var ca = commitMap[a]
+        var cb = commitMap[b2]
+        if (!ca || !cb) return 0
+        return (cb.time - ca.time) || (cb.endSeq - ca.endSeq)
+      })
+      rootOwn.forEach(function (k) {
+        rows.push({ kind: 'commit', key: k })
+        rowIndex[k] = rows.length - 1
+      })
+    }
+  })
+  ordered.forEach(function (b) { if (b.parentId !== null) place(b.id) })
+
+  var rowOf = rowIndex
+  var geom = []
+  ordered.forEach(function (b) {
+    var info = branchInfo[b.id]
+    var forkRow = info.forkKey !== null && rowOf[info.forkKey] !== undefined ? rowOf[info.forkKey] : -1
+    var headKey = info.ownKeys.length > 0 ? info.ownKeys.slice().sort(function (a, c) {
+      var ca = commitMap[a]
+      var cc = commitMap[c]
+      if (!ca || !cc) return 0
+      return (cc.time - ca.time) || (cc.endSeq - ca.endSeq)
+    })[0] : null
+    var headRow = headKey !== null && rowOf[headKey] !== undefined ? rowOf[headKey] : -1
+    var tipRow = -1
+    if (info.empty) {
+      for (var r2 = 0; r2 < rows.length; r2++) {
+        if (rows[r2].kind === 'tip' && rows[r2].branchId === b.id) { tipRow = r2; break }
+      }
+    }
     geom.push({
       id: b.id,
       title: b.title,
       lane: laneOf[b.id],
       parentId: b.parentId,
-      ownKeys: ownKeys,
-      own: own,
-      empty: own === 0,
-      forkKey: forkKey,
-      forkRow: forkKey !== null ? rowOf[forkKey] : -1,
-      headRow: headKey !== null ? rowOf[headKey] : -1,
+      ownKeys: info.ownKeys,
+      own: info.ownKeys.length,
+      empty: info.empty,
+      forkKey: info.forkKey,
+      forkRow: forkRow,
+      headRow: headRow,
+      tipRow: tipRow,
     })
   })
   return {
     ordered: ordered,
     laneOf: laneOf,
-    keys: keys,
+    keys: rows.map(function (r) { return r.kind === 'commit' ? r.key : null }).filter(Boolean),
+    rows: rows,
     rowOf: rowOf,
     commitMap: commitMap,
     geom: geom,
     lanes: ordered.length,
-    rows: keys.length,
+    rowCount: rows.length,
   }
 }
 
@@ -195,7 +256,17 @@ function apply(ctx) {
   }
 
   // pending checkout jump: consumed by the header scroll watcher.
-  var jump = { target: null }
+  // Reactive store: every setJump notifies subscribers so the watcher always
+  // re-evaluates (fixes same-branch checkout being skipped ~50% of the time).
+  var jump = { target: null, version: 0, subs: new Set() }
+  var setJump = function (t) {
+    jump.target = t
+    jump.version++
+    for (var f of jump.subs) f()
+  }
+  var subJump = function (f) { jump.subs.add(f); return function () { jump.subs.delete(f) } }
+  var getJumpVersion = function () { return jump.version }
+  var clearJump = function () { setJump(null) }
 
   // ------------------------------------------------------------------
   // Graph card body (betterSidebar tab component)
@@ -260,14 +331,15 @@ function apply(ctx) {
     }
     var L = activeTree ? layoutTree(data, activeTree) : null
     var lanes = L ? L.lanes : 0
-    var rows = L ? L.rows : 0
+    var rowCount = L ? L.rowCount : 0
     var width = PAD_X * 2 + lanes * LANE_W + CONTENT_W
     var laneEndX = PAD_X + lanes * LANE_W
-    var height = LABEL_H + rows * ROW_H + PAD_X + 6
+    var height = TOP_PAD + LABEL_H + rowCount * ROW_H + PAD_X + 6
     var laneX = function (i) { return PAD_X + i * LANE_W + LANE_W / 2 }
-    var rowY = function (i) { return LABEL_H + i * ROW_H + ROW_H / 2 + 4 }
+    var rowY = function (i) { return TOP_PAD + LABEL_H + i * ROW_H + ROW_H / 2 + 4 }
 
-    // jump into another session, keeping the Git 图谱 card open there
+    // jump into another session, keeping the Git 图谱 card open there.
+    // url seed = CONTENT open => the panel is expanded automatically if collapsed.
     var prepareTargetSession = function (targetId) {
       if (!bsService || !bsService.openTab) return
       if (props.store && typeof props.store.reduceFor === 'function') {
@@ -275,10 +347,10 @@ function apply(ctx) {
           props.store.reduceFor(targetId, function (draft) { draft.panelOpen = true })
         } catch (e) { /* ignore */ }
       }
-      try { bsService.openTab({ type: TAB_ID }, { sessionId: targetId }) } catch (e) { /* ignore */ }
+      try { bsService.openTab({ type: TAB_ID, url: 'dsh-session-graph://focus', title: 'Git 图谱' }, { sessionId: targetId }) } catch (e) { /* ignore */ }
     }
     var openCommit = function (c) {
-      jump.target = { sessionId: c.sessionId, turn: c.turn, userSeq: c.userSeq }
+      setJump({ sessionId: c.sessionId, turn: c.turn, userSeq: c.userSeq })
       if (c.sessionId !== sessionId && sessionsSvc) {
         prepareTargetSession(c.sessionId)
         sessionsSvc.open(c.sessionId)
@@ -314,11 +386,12 @@ function apply(ctx) {
       return React.createElement('div', { className: 'sgx-tab' }, React.createElement('div', { className: 'sgx-err' }, '加载失败：' + data.error))
     }
 
-    // ---------- svg children ----------
+    // ---------- svg children (one CELL per element) ----------
     var lanePaths = []
     var commitGroups = []
     var tipGroups = []
 
+    // lane lines: junction (fork point, shared with the parent) -> head
     L.geom.forEach(function (g) {
       if (g.empty || g.forkRow < 0 || g.headRow < 0) return
       var lx = laneX(g.lane)
@@ -335,29 +408,12 @@ function apply(ctx) {
       }
       lanePaths.push({ d: d, color: color })
     })
-
-    L.keys.forEach(function (k) {
-      var c = L.commitMap[k]
-      if (!c) return
-      var ownerLane = L.laneOf[c.sessionId]
-      if (ownerLane === undefined) return
-      var dx = laneX(ownerLane)
-      var dy = rowY(L.rowOf[k])
-      var dcolor = laneColor(ownerLane)
-      var selected = selKey === k
-      commitGroups.push(React.createElement('g', { key: k, className: 'sgx-cg', style: { cursor: 'pointer' }, onClick: function () { setSelKey(k) } },
-        React.createElement('circle', { cx: dx, cy: dy, r: 8, fill: 'transparent' }),
-        selected && React.createElement('circle', { cx: dx, cy: dy, r: 8, fill: 'none', stroke: 'var(--dsw-alias-brand-primary)', strokeWidth: 2 }),
-        React.createElement('circle', { cx: dx, cy: dy, r: 4.5, fill: dcolor, stroke: 'var(--dsw-alias-bg-overlay)', strokeWidth: 1 }),
-        React.createElement('text', { x: laneEndX + 10, y: dy + 4, fontSize: 11.5, fill: 'var(--dsw-alias-label-secondary)', style: { cursor: 'pointer' } }, truncate(c.title, 30))))
-    })
-
-    // empty-branch tip markers: clickable hollow ring at the fork point
+    // empty branches: junction elbow + stub up to the tip cell
     L.geom.forEach(function (g) {
-      if (!g.empty || g.forkRow < 0) return
+      if (!g.empty || g.forkRow < 0 || g.tipRow < 0) return
       var lx = laneX(g.lane)
       var ly = rowY(g.forkRow)
-      var ty = ly - TIP_STUB - 3
+      var ty = rowY(g.tipRow)
       var color = laneColor(g.lane)
       var parentLane = g.parentId !== null && L.laneOf[g.parentId] !== undefined ? L.laneOf[g.parentId] : null
       var d = null
@@ -366,15 +422,40 @@ function apply(ctx) {
         d = 'M ' + px + ' ' + ly + ' L ' + (lx - 5) + ' ' + ly + ' Q ' + lx + ' ' + ly + ' ' + lx + ' ' + (ly - 5) + ' L ' + lx + ' ' + ty
       }
       if (d) lanePaths.push({ d: d, color: color })
-      var tipKey = '__tip__' + g.id
-      var forkCommit = g.forkKey ? L.commitMap[g.forkKey] : null
-      var selected = selKey === tipKey
-      tipGroups.push(React.createElement('g', { key: tipKey, className: 'sgx-tip', style: { cursor: 'pointer' }, onClick: function () { setSelKey(tipKey) } },
-        React.createElement('circle', { cx: lx, cy: ty, r: 8, fill: 'transparent' }),
-        React.createElement('circle', { cx: lx, cy: ty, r: 5, fill: 'none', stroke: color, strokeWidth: 2 }),
-        selected && React.createElement('circle', { cx: lx, cy: ty, r: 8, fill: 'none', stroke: 'var(--dsw-alias-brand-primary)', strokeWidth: 2 }),
-        React.createElement('circle', { cx: lx, cy: ty, r: 1.8, fill: color }),
-        forkCommit && React.createElement('text', { x: laneEndX + 10, y: ty + 4, fontSize: 11.5, fill: 'var(--dsw-alias-label-secondary)', style: { cursor: 'pointer' } }, '新分支 · ' + truncate(g.title, 22))))
+    })
+
+    L.rows.forEach(function (cell, ri) {
+      var y = rowY(ri)
+      if (cell.kind === 'commit') {
+        var k = cell.key
+        var c = L.commitMap[k]
+        if (!c) return
+        var ownerLane = L.laneOf[c.sessionId]
+        if (ownerLane === undefined) return
+        var dx = laneX(ownerLane)
+        var dcolor = laneColor(ownerLane)
+        var selected = selKey === k
+        commitGroups.push(React.createElement('g', { key: k, className: 'sgx-cg', style: { cursor: 'pointer' }, onClick: function () { setSelKey(k) } },
+          React.createElement('circle', { cx: dx, cy: y, r: 8, fill: 'transparent' }),
+          selected && React.createElement('circle', { cx: dx, cy: y, r: 8, fill: 'none', stroke: 'var(--dsw-alias-brand-primary)', strokeWidth: 2 }),
+          React.createElement('circle', { cx: dx, cy: y, r: 4.5, fill: dcolor, stroke: 'var(--dsw-alias-bg-overlay)', strokeWidth: 1 }),
+          React.createElement('text', { x: laneEndX + 10, y: y + 4, fontSize: 11.5, fill: 'var(--dsw-alias-label-secondary)', style: { cursor: 'pointer' } }, truncate(c.title, 30))))
+      } else {
+        var g = null
+        for (var ti = 0; ti < L.geom.length; ti++) if (L.geom[ti].id === cell.branchId) { g = L.geom[ti]; break }
+        if (!g) return
+        var lx2 = laneX(g.lane)
+        var color2 = laneColor(g.lane)
+        var tipKey2 = '__tip__' + g.id
+        var forkCommit = g.forkKey ? L.commitMap[g.forkKey] : null
+        var sel2 = selKey === tipKey2
+        tipGroups.push(React.createElement('g', { key: tipKey2, className: 'sgx-tip', style: { cursor: 'pointer' }, onClick: function () { setSelKey(tipKey2) } },
+          React.createElement('circle', { cx: lx2, cy: y, r: 8, fill: 'transparent' }),
+          React.createElement('circle', { cx: lx2, cy: y, r: 5, fill: 'none', stroke: color2, strokeWidth: 2 }),
+          sel2 && React.createElement('circle', { cx: lx2, cy: y, r: 8, fill: 'none', stroke: 'var(--dsw-alias-brand-primary)', strokeWidth: 2 }),
+          React.createElement('circle', { cx: lx2, cy: y, r: 1.8, fill: color2 }),
+          forkCommit && React.createElement('text', { x: laneEndX + 10, y: y + 4, fontSize: 11.5, fill: 'var(--dsw-alias-label-secondary)', style: { cursor: 'pointer' } }, '新分支 · ' + truncate(g.title, 24))))
+      }
     })
 
     // ---------- selection / detail ----------
@@ -434,6 +515,7 @@ function apply(ctx) {
   function HeaderEntry(props) {
     var sessionId = props.sessionId
     var useSession = props.useSession
+    var jumpVersion = React.useSyncExternalStore(subJump, getJumpVersion)
     var target = jump.target
     var turn = target && target.sessionId === sessionId ? target.turn : undefined
     var userSeq = target && target.sessionId === sessionId ? target.userSeq : undefined
@@ -469,7 +551,7 @@ function apply(ctx) {
         if (finished) return
         if (scroll()) {
           finished = true
-          clear = timerCtx.timeout(function () { scroll(); jump.target = null }, 900)
+          clear = timerCtx.timeout(function () { scroll(); clearJump() }, 900)
           return
         }
         if (++tries >= 24) { finished = true; return }
@@ -477,15 +559,15 @@ function apply(ctx) {
       }
       clear = timerCtx.timeout(step, 150)
       return function () { finished = true; if (clear) clear() }
-    }, [anchorKey])
+    }, [anchorKey, jumpVersion])
     return React.createElement('button', {
       type: 'button',
       className: 'sgx-entry',
       title: '在右侧边栏打开 Git 图谱（branch=会话，commit=一轮请求+完成）',
       onClick: function () {
         if (bsService && bsService.openTab) {
-          if (sessionId) bsService.openTab({ type: TAB_ID }, { sessionId: sessionId })
-          else bsService.openTab({ type: TAB_ID })
+          if (sessionId) bsService.openTab({ type: TAB_ID, url: 'dsh-session-graph://focus', title: 'Git 图谱' }, { sessionId: sessionId })
+          else bsService.openTab({ type: TAB_ID, url: 'dsh-session-graph://focus', title: 'Git 图谱' })
         }
       },
     }, 'Git 图谱')
