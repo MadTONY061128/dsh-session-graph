@@ -264,8 +264,15 @@ export function apply(ctx) {
         hops++
       }
       const ownCommits = native.get(id) || []
+      // A child's chain keeps ONLY the ancestor commits its seed actually
+      // reaches (endSeq < seedLength) — the fork point is the last inherited
+      // commit, not the parent's newest. Without this truncation a mid-fork
+      // child's junction drifts to the parent's (or its own) latest commit.
+      const sl = seedLengths.get(id) ?? 0
       const chain = []
-      for (const aid of ancestors) for (const c of (native.get(aid) || [])) chain.push(c.key)
+      for (const aid of ancestors) for (const c of (native.get(aid) || [])) {
+        if (c.endSeq < sl) chain.push(c.key)
+      }
       for (const c of ownCommits) chain.push(c.key)
       branches.push({
         id,
