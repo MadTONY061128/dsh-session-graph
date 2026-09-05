@@ -6,7 +6,9 @@ Git-graph 风格的项目对话分叉追踪插件（DSH web profile bundle）。
 
 - **branch = 会话**：每个分叉出的子会话是一条分支，分支名 = 会话标题；
 - **commit = 一轮「用户请求 + 完成」**：由 DeepSeek 自动总结要点（也可手动「AI 摘要」，结果持久化到 `~/.dsh/storages/session_graph.json`）；
-- **命名 / 内容 / 操作保持同步对应**：分支与提交都有名称、摘要内容与「checkout / 分叉」操作。
+- **命名 / 内容 / 操作保持同步对应**：分支与提交都有名称、摘要内容与「checkout / 分叉 / 合入」操作。
+- **merge = $B \otimes A$**：把供体分支 A 相对最近公共祖先（LCA）的增量，经 **information-object 萃取**
+  （命题 + 依据分类 + 负命题边界 + 开放问题）合流进受体分支 B；不改写 B 日志、不改 B 身份，可回滚、可注入。
 
 ## 功能（v0.3）
 
@@ -26,6 +28,23 @@ Git-graph 风格的项目对话分叉追踪插件（DSH web profile bundle）。
 6. 新完成的轮次自动生成 AI 要点；历史提交可逐条「AI 摘要」；
 7. 提交归属规则：子会话 `seedLength` 之前的提交归属父分支（共享提交在图谱中只出现一次），
    多级分叉正确折叠。
+
+## 分支合入（merge，v0.4）
+
+- **发起**：选中某分支（提交 / 空分支 tip），详情面板出现「合并此分支到当前分支」
+  （A=所选分支，B=当前会话所在分支）。
+- **语义**：非对称 $B \otimes A$；仅当 A、B 同树且 A 非 B 的祖先时可合并
+  （否则返回 `already-contained` / `unrelated` / `self`）；$A_{\text{diff}}$ = A 链上
+  LCA 之后的提交。
+- **萃取**：LLM 按 information-object 规范把 $A_{\text{diff}}$ 投影为
+  `{ purpose, propositions[{claim, ground:{kind, evidence}}], negativeConstraints[], openQuestions[], deliberateExclusions[] }`
+  —— `ground.kind ∈ observed|inferred|assumed|produced`，去除元叙事/重复，保留负命题与开放边界；
+  主干优先（B 状态不被篡改，冲突标为 `negativeConstraints`）。
+- **图表示**：合入 = B 链头之上的**方形节点**（双亲：B 上一链头 + A 链头 S 曲线接入）；
+  可点击查看 IO 详情。
+- **注入 / 回滚**：merge 节点详情可「注入到受体上下文」（把 IO 以 `user/message`
+  context 事件写入 live 的 B，供 B 的 agent 读取）与「撤销合入」（置 `reverted`，图谱回到原链头，
+  保留审计）。无有效增量（$\Delta I \le 0$）时拒绝合并。
 
 ### v0.3 修复
 
@@ -71,15 +90,19 @@ dsh plugin --profile web remove dsh-session-graph
 
 ## 数据契约
 
-- `GET /sgx/graph?session=<id>` → `{ workspace, branches[], commits[], current }`
+- `GET /sgx/graph?session=<id>` → `{ workspace, branches[], commits[], merges[], current }`
   - branch：`{ id, title, parentId, createdAt, updatedAt, commitCount, chain[], headKey }`
   - commit：`{ key: "<owner>:<turn>", sessionId(owner), turn, userSeq, endSeq, time, userText, human, title, summary, status: 'ai'|'fallback'|'pending' }`
+  - merge：`{ id, key:"mg:<id>", sourceA, targetB, lcaKey, sourceHeadKey, headBeforeB, time, status, injected, title, summary, io }`
 - `POST /sgx/summarize { sessionId, turn }` → `{ ok, summary, fallback }`
+- `POST /sgx/merge { sourceA, targetB }` → `{ ok, merge } | { ok:false, code: 'self'|'already-contained'|'unrelated'|'no-effective-increment'|'llm-failed'|'not-found' }`
+- `POST /sgx/merge/revert { mergeId }` → `{ ok } | { ok:false, code }`
+- `POST /sgx/merge/inject { mergeId }` → `{ ok } | { ok:false, code:'reverted'|'target-not-live'|'append-failed' }`
 
 ## 已知边界
 
 - 会话窗口只加载尾部消息时，旧提交的「checkout 滚动定位」会静默跳过（会话已正确打开）；
-- 摘要调用使用当前默认模型（`agentDefaultModel`），失败自动回退为「完成：<回复首行>」；
+- 摘要/萃取调用使用当前默认模型（`agentDefaultModel`），失败回退（摘要→首行；萃取→逐提交要点，ground=inferred）；
 - `/sgx/*` 仅允许 loopback 客户端访问（与 dsh-git-graph 同款围栏）；
-- 侧边栏卡片的开合状态按会话持久化（better-sidebar 原生行为）；目标会话卡片被手动关闭时，
-  跨会话 checkout 会预展开（`SidebarState.panelOpen` + `openTab(scope)`），此后随用户开关。
+- **注入仅对 live 的受体会话生效**（`target-not-live` 时提示先打开该分支）；merge 本身在图层已落库，注入是可选动作；
+- 冲突自动消解对 B 全量命题、离线 B 注入、真实信息熵 $\Delta I$ 度量 为 v2 项。
