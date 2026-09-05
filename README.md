@@ -38,13 +38,33 @@ Git-graph 风格的项目对话分叉追踪插件（DSH web profile bundle）。
   LCA 之后的提交。
 - **萃取**：LLM 按 information-object 规范把 $A_{\text{diff}}$ 投影为
   `{ purpose, propositions[{claim, ground:{kind, evidence}}], negativeConstraints[], openQuestions[], deliberateExclusions[] }`
-  —— `ground.kind ∈ observed|inferred|assumed|produced`，去除元叙事/重复，保留负命题与开放边界；
+  —— `ground.kind ∈ observed|inferred|assumed|produced`，`evidence` 引用差分提交编号；
   主干优先（B 状态不被篡改，冲突标为 `negativeConstraints`）。
-- **图表示**：合入 = B 链头之上的**方形节点**（双亲：B 上一链头 + A 链头 S 曲线接入）；
-  可点击查看 IO 详情。
-- **注入 / 回滚**：merge 节点详情可「注入到受体上下文」（把 IO 以 `user/message`
-  context 事件写入 live 的 B，供 B 的 agent 读取）与「撤销合入」（置 `reverted`，图谱回到原链头，
-  保留审计）。无有效增量（$\Delta I \le 0$）时拒绝合并。
+- **图表示**：合入 = B 链头之上的**方形节点**（双亲：B 上一链头 + A 链头 S 曲线接入）。
+- **注入 / 回滚**：merge 节点详情可「注入到受体上下文」与「撤销合入」（置 `reverted`，
+  图谱回到原链头，保留审计）。无有效增量（$\Delta I \le 0$）时拒绝合并。
+
+## 分支入口语义与结构自觉（v0.5，上下文开销受控）
+
+注入内容不再是「孤立的 IO 断言」，而是**被合入分支的可追溯入口**（≤800 字符）：
+
+- 自述「这不是任务指令，而是被合入分支的入口」+ 合入身份（A→B、共同祖先、差分提交 `#t1..#tn`）；
+- 每条命题带 `依据等级 + 来源提交锚点（#turn）`（`ground.evidence` 提交编号 → diff turn 映射）；
+- 指针收尾：「完整命题/原文：`session_graph_read "mg:<id>"`；侧栏可 checkout 溯源」——
+  **常驻的只有入口指针，证据在被需要时才进入上下文**（按需拉取，不长期占用）。
+
+**结构自觉（agent 知道自己身处会话树）**：
+
+- 按 agent 作用域注册 prompt section（`agent/created` → `agent.ctx.systemPrompt.section`）：
+  项目会话获得 ~100–150 token 的「【会话树】分支位置 + 同树分支 + 合入 + 溯源指引」；
+  非项目会话返回空串（**0 开销**），工具 schema 仅对项目会话注册；
+- 三个模型可见工具（`agent.ctx.tools.register`，按作用域）：
+  - `session_graph_view`：项目图谱摘要（分支树/提交/合入）；
+  - `session_graph_read {target}`：分支 id/标题、提交 key、`mg:` 合入 key → 完整内容（提交原文/完整 IO）；
+  - `session_graph_merge {source, target?}`：agent 主动发起合入（target 缺省=调用会话分支）。
+
+成本模型：常驻增量 ≈ 150（section）+ 200（工具 schema）token/请求（仅项目会话）；
+注入 ~200–400 token/条（一次性、显式触发）；工具返回为当轮内容。相对会话历史 <1%。
 
 ### v0.3 修复
 

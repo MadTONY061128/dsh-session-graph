@@ -199,7 +199,7 @@ export function apply(ctx) {
   // ---------- information-object extraction (merge) ----------
   const IO_SYSTEM = '你是一个信息对象萃取器（information-object）。把下面的会话提交（每条 = 用户请求 + 完成要点）相对合并目标 B 萃取为一个严格 JSON 对象。规则：' +
     '1) purpose：用一句中文说明这些增量对 B 的作用；' +
-    '2) propositions：只保留有独立作用、与 B 目标相关的结论命题，去除元叙事/过渡句/重复内容，每条形如 {claim, ground:{kind, evidence}}；' +
+    '2) propositions：只保留有独立作用、与 B 目标相关的结论命题，去除元叙事/过渡句/重复内容，每条形如 {claim, ground:{kind, evidence}}，evidence 必须引用输入中的提交编号（如"【2】"）；' +
     '3) negativeConstraints：A 踩坑确立的负命题（某方案不可行/黑名单试错），每条带 ground；' +
     '4) openQuestions：未验证但对 B 重要、需保持开放边界的假设（字符串数组）；' +
     '5) deliberateExclusions：明确剔除的跑偏/无关内容（字符串数组）。' +
@@ -297,7 +297,87 @@ export function apply(ctx) {
       title: m.io && m.io.purpose ? firstLine(m.io.purpose, 40) : '合并',
       summary: renderIoText(m),
       io: m.io,
+      diffKeys: m.diffKeys || [],
+      diffTurns: m.diffTurns || [],
     }
+  }
+
+  // ---------- compact merge entry (injection v2: traceable branch entry) ----------
+  function turnLabelOf(key) {
+    const idx = String(key || '').split(':')[1]
+    return idx || String(key || '').slice(0, 8)
+  }
+  function evTurnOf(p, i, diffTurns) {
+    const ev = p.ground && p.ground.evidence ? String(p.ground.evidence) : ''
+    const m = ev.match(/(\d+)/)
+    const n = m ? parseInt(m[1], 10) : 0
+    if (n >= 1 && n <= (diffTurns || []).length) return '#' + diffTurns[n - 1]
+    return (diffTurns || [])[i] !== undefined ? '#' + diffTurns[i] : ev
+  }
+  function renderMergeEntry(m) {
+    const io = m.io || {}
+    const diffTurns = m.diffTurns || []
+    const n = diffTurns.length
+    const parts = []
+    parts.push('【分支合入】「' + (m.sourceTitle || '') + '」已合入本分支「' + (m.targetTitle || '') + '」——这不是任务指令，而是被合入分支的入口：')
+    parts.push('共同祖先 #' + (m.lcaKey ? turnLabelOf(m.lcaKey) : '无') + '，并入 ' + n + ' 个差分提交：' + (n ? diffTurns.map((t) => '#' + t).join('、') : '（空）') + '。')
+    if (io.purpose) parts.push('目的：' + io.purpose)
+    const tops = (io.propositions || []).slice(0, 5).map((p, i) => '- [' + ((p.ground && p.ground.kind) || 'inferred') + '] ' + p.claim + '（来源 ' + evTurnOf(p, i, diffTurns) + '）')
+    if (tops.length) parts.push('要点：' + tops.join(' '))
+    if ((io.negativeConstraints || []).length) parts.push('不可行（前车之鉴）：' + io.negativeConstraints.slice(0, 3).map((x) => x.claim).join('；'))
+    if ((io.openQuestions || []).length) parts.push('待验证：' + io.openQuestions.slice(0, 3).join('；'))
+    parts.push('完整命题、依据与提交原文：session_graph_read "mg:' + m.id + '"；右侧「Git 图谱」侧栏可 checkout 至任意提交溯源。')
+    return parts.join('\n')
+  }
+
+  // ---------- per-session structural frame (prompt section, agent-scoped) ----------
+  const frameCache = new Map()
+  function updateFrames(p) {
+    const byBranch = new Map()
+    for (const b of p.branches) byBranch.set(b.id, b)
+    const rootOf = (id) => {
+      let c = byBranch.get(id)
+      let hops = 0
+      while (c && c.parentId && byBranch.get(c.parentId) && hops < 64) { c = byBranch.get(c.parentId); hops++ }
+      return c ? c.id : id
+    }
+    const roots = new Map()
+    for (const b of p.branches) roots.set(b.id, rootOf(b.id))
+    const activeM = [...merges.values()].filter((m) => m.status === 'active')
+    for (const b of p.branches) {
+      const root = roots.get(b.id)
+      const siblings = p.branches.filter((x) => x.id !== b.id && roots.get(x.id) === root).map((x) => x.title)
+      const mergesIn = activeM.filter((m) => m.targetB === b.id && byBranch.has(m.sourceA)).map((m) => byBranch.get(m.sourceA).title)
+      const mergesOut = activeM.filter((m) => m.sourceA === b.id && byBranch.has(m.targetB)).map((m) => byBranch.get(m.targetB).title)
+      const parent = b.parentId && byBranch.has(b.parentId) ? byBranch.get(b.parentId) : null
+      let forkTitle = null
+      if (b.commitCount > 0 && b.chain.length > b.commitCount) {
+        const fc = p.commitByKey.get(b.chain[b.chain.length - b.commitCount - 1])
+        if (fc) forkTitle = firstLine(fc.firstUser, 24) || ('#' + fc.turn)
+      } else if (b.chain.length > 0 && parent) {
+        const fc = p.commitByKey.get(b.chain[b.chain.length - 1])
+        if (fc) forkTitle = firstLine(fc.firstUser, 24) || ('#' + fc.turn)
+      }
+      frameCache.set(b.id, {
+        title: b.title,
+        parentTitle: parent ? parent.title : null,
+        forkTitle,
+        siblingTitles: siblings,
+        mergesIn,
+        mergesOut,
+      })
+    }
+  }
+  function frameFor(sessionId) {
+    const f = frameCache.get(sessionId)
+    if (!f) return ''
+    const parts = []
+    parts.push('【会话树】你处于「Git 图谱」会话树的分支『' + f.title + '』' + (f.parentTitle ? '（父分支『' + f.parentTitle + '』' + (f.forkTitle ? '，分叉于『' + f.forkTitle + '』' : '') + '）' : '（根分支）') + '。')
+    if (f.siblingTitles.length) parts.push('同树其他分支：' + f.siblingTitles.join('、') + '。')
+    if (f.mergesIn.length) parts.push('已合入本分支：' + f.mergesIn.join('、') + '。')
+    if (f.mergesOut.length) parts.push('本分支已合入：' + f.mergesOut.join('、') + '。')
+    parts.push('会话中的【分支合入】消息是已并入的可追溯结论（非待执行任务）；可用 session_graph_view/read 溯源，右侧「Git 图谱」侧栏可视化同一结构。')
+    return parts.join('\n')
   }
 
   // ---------- project corpus (shared by graph & merge) ----------
@@ -408,12 +488,11 @@ export function apply(ctx) {
       branchById.set(id, branch)
     }
 
+    updateFrames({ byId, ws, cwd, safeMembers, memberSet, titles, seedLengths, native, commitByKey, branches, branchById })
     return { byId, ws, cwd, safeMembers, memberSet, titles, seedLengths, native, commitByKey, branches, branchById }
   }
 
-  async function buildGraph(targetId) {
-    const p = await loadProject(targetId)
-    if (p.error) return { error: p.error }
+  function serializeCommits(p) {
     const commits = []
     const seenCommit = new Set()
     for (const b of p.branches) {
@@ -438,6 +517,9 @@ export function apply(ctx) {
         })
       }
     }
+    return commits
+  }
+  function serializeMerges(p) {
     const activeMerges = []
     for (const m of merges.values()) {
       if (m.status !== 'active') continue
@@ -445,15 +527,24 @@ export function apply(ctx) {
       activeMerges.push(serializeMerge(m, p.branchById))
     }
     activeMerges.sort((a, b) => (a.time || 0) - (b.time || 0))
+    return activeMerges
+  }
+  function projectLabel(p) {
     return {
-      workspace: {
-        id: p.ws ? p.ws.id : '',
-        path: p.ws ? p.ws.path : (p.cwd || ''),
-        title: p.ws ? p.ws.title : (p.cwd ? (p.cwd.split('/').filter(Boolean).pop() || p.cwd) : '未命名项目'),
-      },
+      id: p.ws ? p.ws.id : '',
+      path: p.ws ? p.ws.path : (p.cwd || ''),
+      title: p.ws ? p.ws.title : (p.cwd ? (p.cwd.split('/').filter(Boolean).pop() || p.cwd) : '未命名项目'),
+    }
+  }
+
+  async function buildGraph(targetId) {
+    const p = await loadProject(targetId)
+    if (p.error) return { error: p.error }
+    return {
+      workspace: projectLabel(p),
       branches: p.branches,
-      commits,
-      merges: activeMerges,
+      commits: serializeCommits(p),
+      merges: serializeMerges(p),
       current: targetId,
       generatedAt: Date.now(),
     }
@@ -503,9 +594,12 @@ export function apply(ctx) {
       status: 'active',
       injected: false,
       io,
+      diffKeys,
+      diffTurns: diffCommits.map((c) => c.turn),
     }
     merges.set(rec.id, rec)
     if (mergeTable) { try { await mergeTable.put(rec.id, rec) } catch (e) { console.error('[git-graph] merge persist failed', e) } }
+    updateFrames(p)
     return { ok: true, merge: serializeMerge(rec, p.branchById) }
   }
 
@@ -515,6 +609,7 @@ export function apply(ctx) {
     if (m.status === 'reverted') return { ok: false, code: 'already-reverted' }
     m.status = 'reverted'
     if (mergeTable) { try { await mergeTable.put(mergeId, m) } catch (e) { console.error('[git-graph] merge revert persist failed', e) } }
+    try { await loadProject(m.targetB) } catch (e) { /* frames refresh best-effort */ }
     return { ok: true }
   }
 
@@ -524,10 +619,13 @@ export function apply(ctx) {
     if (m.status !== 'active') return { ok: false, code: 'reverted' }
     const session = SESS.get(m.targetB)
     if (!session) return { ok: false, code: 'target-not-live', hint: '打开受体分支后再注入' }
+    let view = m
+    const p = await loadProject(m.targetB)
+    if (!p.error) view = serializeMerge(m, p.branchById)
     const msg = {
       id: 'sgm-' + Math.random().toString(36).slice(2, 12),
       role: 'user',
-      content: [{ type: 'text', text: renderIoText(m) }],
+      content: [{ type: 'text', text: renderMergeEntry(view) }],
       source: { kind: 'plugin', plugin: 'dsh-session-graph', form: 'recall' },
     }
     try {
@@ -612,4 +710,174 @@ export function apply(ctx) {
       return json(res, 404, { error: 'not-found' })
     },
   }), 'dsh-session-graph: /sgx routes')
+
+  // ---------- model-visible tools (registered per project-session agent) ----------
+  function toolOutput() {
+    return { schema: { type: 'object', additionalProperties: true }, render: (_a, v) => [{ type: 'text', text: JSON.stringify(v) }] }
+  }
+  function callingSession(exec) {
+    const s = exec && exec.agent && exec.agent.session
+    return s && typeof s.id === 'string' ? { id: s.id, cwd: s.header && s.header.cwd } : null
+  }
+  const viewTool = {
+    name: 'session_graph_view',
+    description: '查看当前会话所在项目的 Git 图谱摘要（branch=会话，commit=一轮请求+完成，merge=分支合入），含分支树与合入记录。',
+    parameters: { type: 'object', additionalProperties: false, properties: {} },
+    output: toolOutput(),
+    timeoutMs: 60000,
+    async execute(_args, exec) {
+      const s = callingSession(exec)
+      if (!s) return { ok: false, code: 'no-project' }
+      const p = await loadProject(s.id)
+      if (p.error) return { ok: false, code: p.error }
+      return {
+        ok: true,
+        workspace: projectLabel(p),
+        branches: p.branches.map((b) => ({ id: b.id, title: b.title, parentId: b.parentId, commitCount: b.commitCount, headKey: b.headKey })),
+        commits: serializeCommits(p).map((c) => ({ key: c.key, sessionId: c.sessionId, turn: c.turn, title: c.title, time: c.time })),
+        merges: serializeMerges(p).map((m) => ({ id: m.id, key: m.key, sourceTitle: m.sourceTitle, targetTitle: m.targetTitle, title: m.title, injected: m.injected, diffTurns: m.diffTurns })),
+        current: s.id,
+      }
+    },
+  }
+  const readTool = {
+    name: 'session_graph_read',
+    description: '读取图谱中一个分支、提交或合入节点的完整内容。target 可为分支 id/标题、提交 key（"session-…:turn"）、合入 key（"mg:…"）。用于追溯被合入结论的来源与原文。',
+    parameters: { type: 'object', additionalProperties: false, required: ['target'], properties: { target: { type: 'string', description: '分支 id/标题、提交 key 或合入 key' } } },
+    output: toolOutput(),
+    timeoutMs: 60000,
+    async execute(args, exec) {
+      const s = callingSession(exec)
+      if (!s) return { ok: false, code: 'no-project' }
+      const p = await loadProject(s.id)
+      if (p.error) return { ok: false, code: p.error }
+      const target = typeof (args && args.target) === 'string' ? args.target : ''
+      if (!target) return { ok: false, code: 'bad-args' }
+      if (target.startsWith('mg:')) {
+        const m = merges.get(target.slice(3))
+        if (!m) return { ok: false, code: 'not-found' }
+        return { ok: true, kind: 'merge', merge: serializeMerge(m, p.branchById) }
+      }
+      const c = p.commitByKey.get(target)
+      if (c) {
+        const stub = summaries.get(target)
+        return {
+          ok: true,
+          kind: 'commit',
+          commit: {
+            key: target,
+            sessionId: c.owner,
+            turn: c.turn,
+            time: c.time,
+            branch: p.branchById.has(c.owner) ? p.branchById.get(c.owner).title : '',
+            userRequest: c.firstUser.slice(0, 300),
+            assistantReply: c.ass.slice(0, 4000),
+            summary: stub ? stub.summary : '',
+          },
+        }
+      }
+      let b = p.branchById.get(target)
+      if (!b) { for (const x of p.branches) if (x.title === target) { b = x; break } }
+      if (!b) return { ok: false, code: 'not-found' }
+      const own = b.commitCount || 0
+      const forkKey = own > 0 && b.chain.length > own ? b.chain[b.chain.length - own - 1] : (b.chain.length > 0 ? b.chain[b.chain.length - 1] : null)
+      return {
+        ok: true,
+        kind: 'branch',
+        branch: {
+          id: b.id,
+          title: b.title,
+          parentId: b.parentId,
+          createdAt: b.createdAt,
+          updatedAt: b.updatedAt,
+          forkKey,
+          headKey: b.headKey,
+          commitCount: own,
+          commits: b.chain.map((k) => {
+            const cc = p.commitByKey.get(k)
+            return { key: k, turn: cc ? cc.turn : null, title: cc ? (firstLine(cc.firstUser, 40) || ('#' + cc.turn)) : k, ownedBy: cc ? cc.owner : null }
+          }),
+          merges: serializeMerges(p).filter((m) => m.sourceA === b.id || m.targetB === b.id),
+        },
+      }
+    },
+  }
+  const mergeTool = {
+    name: 'session_graph_merge',
+    description: '把供体分支 source（分支 id 或标题）合入受体分支 target（默认当前会话所在分支）。合入会萃取 source 相对共同祖先的增量信息对象，不改动受体日志，可撤销。',
+    parameters: {
+      type: 'object',
+      additionalProperties: false,
+      required: ['source'],
+      properties: {
+        source: { type: 'string', description: '供体分支 id 或标题' },
+        target: { type: 'string', description: '受体分支 id 或标题；缺省为当前会话所在分支' },
+      },
+    },
+    output: toolOutput(),
+    timeoutMs: 120000,
+    async execute(args, exec) {
+      const s = callingSession(exec)
+      if (!s) return { ok: false, code: 'no-project' }
+      const p = await loadProject(s.id)
+      if (p.error) return { ok: false, code: p.error }
+      const resolveBranch = (t) => {
+        let b = p.branchById.get(t)
+        if (!b) { for (const x of p.branches) if (x.title === t) { b = x; break } }
+        return b
+      }
+      const A = resolveBranch(args && args.source)
+      if (!A) return { ok: false, code: 'not-found' }
+      let targetId
+      if (typeof (args && args.target) === 'string' && args.target) {
+        const B = resolveBranch(args.target)
+        if (!B) return { ok: false, code: 'not-found' }
+        targetId = B.id
+      } else {
+        targetId = s.id
+      }
+      if (!p.branchById.has(targetId)) return { ok: false, code: 'no-project' }
+      return await mergeFor(A.id, targetId)
+    },
+  }
+  function registerAgentSurface(agent) {
+    if (!agent || !agent.ctx) return
+    const sid = agent.session && typeof agent.session.id === 'string' ? agent.session.id : null
+    const cwd = agent.session && agent.session.header && agent.session.header.cwd
+    if (!sid) return
+    const actx = agent.ctx
+    try {
+      actx.systemPrompt.section({ name: 'plugin:session-graph', order: 95, text: () => frameFor(sid) })
+    } catch (e) { console.error('[git-graph] agent section failed', e) }
+    if (typeof cwd === 'string' && cwd) {
+      ;(async () => {
+        try {
+          let ws = W.list().find((w) => w.path === cwd) || null
+          if (!ws) ws = await W.resolveByPath(cwd).catch(() => null)
+          if (!ws) return
+          actx.tools.register(viewTool)
+          actx.tools.register(readTool)
+          actx.tools.register(mergeTool)
+        } catch (e) { console.error('[git-graph] agent tools failed', e) }
+      })()
+    }
+  }
+  ctx.on('agent/created', (payload) => {
+    registerAgentSurface(payload && payload.agent)
+  })
+
+  // boot warm: frames for every workspace (best effort)
+  async function warmFrames() {
+    try {
+      const records = await Q.listSessions()
+      const byId = new Map()
+      for (const r of records) byId.set(r.header.id, r)
+      for (const ws of W.list()) {
+        const ids = (ws.sessionIds || []).filter((id) => byId.has(id))
+        if (ids.length === 0) continue
+        try { await loadProject(ids[0]) } catch (e) { /* skip */ }
+      }
+    } catch (e) { /* best effort */ }
+  }
+  domainReady.then(warmFrames).catch(() => {})
 }

@@ -566,12 +566,21 @@ function apply(ctx) {
         var m = sel.merge
         var io = m.io || {}
         var ioRows = []
+        var evTurnOf = function (p, i) {
+          var ev = p.ground && p.ground.evidence ? String(p.ground.evidence) : ''
+          var mm = ev.match(/(\d+)/)
+          var n = mm ? parseInt(mm[1], 10) : 0
+          var dt = m.diffTurns || []
+          if (n >= 1 && n <= dt.length) return '#' + dt[n - 1]
+          return dt[i] !== undefined ? '#' + dt[i] : ev
+        }
+        ioRows.push(React.createElement('div', { key: 'entry', className: 'sgx-dsum' }, '被合入分支入口：并入 ' + (m.diffTurns || []).length + ' 个差分提交' + ((m.diffTurns || []).length ? ('（' + m.diffTurns.map(function (t) { return '#' + t }).join('、') + '）') : '') + '，共同祖先 #' + String(m.lcaKey || '').split(':')[1]))
         if (io.purpose) ioRows.push(React.createElement('div', { key: 'p', className: 'sgx-dsum' }, '目的：' + io.purpose))
         ;(io.propositions || []).forEach(function (p, pi) {
-          ioRows.push(React.createElement('div', { key: 'pp' + pi, className: 'sgx-dsum' }, '• [' + ((p.ground && p.ground.kind) || 'inferred') + '] ' + p.claim))
+          ioRows.push(React.createElement('div', { key: 'pp' + pi, className: 'sgx-dsum' }, '• [' + ((p.ground && p.ground.kind) || 'inferred') + '] ' + p.claim + '（来源 ' + evTurnOf(p, pi) + ' · ' + truncate(m.sourceTitle, 14) + '）'))
         })
         ;(io.negativeConstraints || []).forEach(function (n, ni) {
-          ioRows.push(React.createElement('div', { key: 'nc' + ni, className: 'sgx-dsum' }, '⊗ 不可行：' + n.claim))
+          ioRows.push(React.createElement('div', { key: 'nc' + ni, className: 'sgx-dsum' }, '⊗ 不可行：' + n.claim + '（来源 ' + evTurnOf(n, ni) + ' · ' + truncate(m.sourceTitle, 14) + '）'))
         })
         ;(io.openQuestions || []).forEach(function (q, qi) {
           ioRows.push(React.createElement('div', { key: 'oq' + qi, className: 'sgx-dsum' }, '? 待验证：' + q))
@@ -626,7 +635,7 @@ function apply(ctx) {
           mergeGroups,
           commitGroups)),
       detail,
-      React.createElement('div', { className: 'sgx-note' }, '点击节点显示详情（checkout 进入该节点会话位置）；分叉与原分支共享分叉前最后一个提交，最新提交在顶部；方形节点=合入（可撤销/注入）。'))
+      React.createElement('div', { className: 'sgx-note' }, '点击节点显示详情（checkout 进入该节点会话位置）；分叉与原分支共享分叉前最后一个提交，最新提交在顶部；方形节点=合入（可撤销/注入）。注入的合入消息是可追溯的结论入口，模型可用 session_graph_view / session_graph_read 溯源原文。'))
   }
 
   // ------------------------------------------------------------------
