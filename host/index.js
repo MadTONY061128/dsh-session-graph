@@ -1,3 +1,5 @@
+import { activeInjectedMergeIds, assertDagInvariants, buildInformationDag } from './dag-core.js'
+
 /**
  * dsh-session-graph — Host half (pure ESM, zero runtime imports).
  *
@@ -10,12 +12,17 @@
  * 数据服务路径（本插件自行注册，供浏览器半区 fetch）：
  *   GET  /sgx/graph?session=<id>     -> 项目图谱 JSON
  *   POST /sgx/summarize              -> { sessionId, turn } -> 生成/重试 AI 要点
- *   POST /sgx/merge                  -> { sourceA, targetB } -> 合入
- *   POST /sgx/merge/revert           -> { mergeId } -> 撤销
- *   POST /sgx/merge/inject           -> { mergeId } -> 注入受体上下文
+ *   POST /sgx/merge                  -> { sessionId, sourceA, targetB } -> 合入
+ *   POST /sgx/merge/revert           -> { sessionId, mergeId } -> Git revert
+ *   POST /sgx/merge/inject           -> { sessionId, mergeId } -> 动态注入
+ *   POST /sgx/merge/uninject         -> { sessionId, mergeId } -> 停止动态注入
+ *   GET  /sgx/settings?session=<id>  -> workspace 隐私设置
+ *   POST /sgx/settings               -> { sessionId, autoSummary }
+ *   POST /sgx/purge                  -> 清理 workspace 插件元数据
  *
  * 持久化：storage-domain "session_graph"（~/.dsh/storages/session_graph.json），
- * 两张表：commits（要点摘要）、merges（合入记录）。只允许 loopback 客户端访问。
+ * 三张表：commits（要点摘要）、merges（DAG 操作）、settings（workspace 设置）。
+ * 只允许 loopback 客户端访问，且所有记录访问再次按 workspace 围栏校验。
  */
 
 export const inject = [
@@ -25,7 +32,6 @@ export const inject = [
   'llm',
   'agentDefaultModel',
   'webServer',
-  'sessions',
 ]
 
 export function apply(ctx) {
@@ -34,20 +40,23 @@ export function apply(ctx) {
   const D = ctx.storageDomain
   const LLM = ctx.llm
   const AM = ctx.agentDefaultModel
-  const SESS = ctx.sessions
-
   const DUCK = Object.freeze({ safeParse: () => ({ success: true }), parse: (v) => v })
   let domain = null
   let table = null
   let mergeTable = null
+  let settingsTable = null
   const summaries = new Map()
   const merges = new Map()
+  const settings = new Map()
+  const projectCache = new Map()
   const domainReady = (async () => {
-    domain = await D.open({ name: 'session_graph', version: 0, tables: { commits: { valueSchema: DUCK }, merges: { valueSchema: DUCK } } })
+    domain = await D.open({ name: 'session_graph', version: 0, tables: { commits: { valueSchema: DUCK }, merges: { valueSchema: DUCK }, settings: { valueSchema: DUCK } } })
     table = domain.table('commits')
     mergeTable = domain.table('merges')
+    settingsTable = domain.table('settings')
     for (const [k, v] of table.entries()) summaries.set(k, v)
     for (const [k, v] of mergeTable.entries()) merges.set(k, v)
+    for (const [k, v] of settingsTable.entries()) settings.set(k, v)
   })().catch((e) => { console.error('[git-graph] storage unavailable', e) })
   ctx.effect(() => {
     return () => {
@@ -55,6 +64,7 @@ export function apply(ctx) {
       domain = null
       table = null
       mergeTable = null
+      settingsTable = null
       if (d) d.close().catch(() => {})
     }
   })
@@ -81,6 +91,23 @@ export function apply(ctx) {
   }
   function rid() {
     return 'sg-' + Math.random().toString(36).slice(2, 12)
+  }
+  function normalizePath(value) {
+    return String(value || '').replace(/\\/g, '/').replace(/\/$/, '').toLowerCase()
+  }
+  function workspaceKeyOf(p) {
+    if (p && p.ws && p.ws.id) return 'ws:' + p.ws.id
+    return 'cwd:' + normalizePath(p && p.cwd)
+  }
+  function currentModel() {
+    const sel = AM.currentSelection()
+    return sel && sel.provider && sel.model ? { provider: sel.provider, model: sel.model } : { provider: '', model: '' }
+  }
+  async function deleteStored(t, key) {
+    if (!t) return
+    if (typeof t.delete === 'function') return await t.delete(key)
+    if (typeof t.remove === 'function') return await t.remove(key)
+    throw new Error('storage-delete-unsupported')
   }
 
   function extractCommits(events) {
@@ -145,18 +172,20 @@ export function apply(ctx) {
       const snap = await Q.readSession(job.sessionId)
       const c = extractCommits(snap.events).find((x) => x.turn === job.turn)
       if (!c) return
+      const p = await loadProject(job.sessionId)
+      if (p.error) return
       const st = await callLlm(c)
       const value = st
-        ? { sessionId: job.sessionId, turn: job.turn, summary: st, generatedAt: Date.now() }
-        : { sessionId: job.sessionId, turn: job.turn, summary: fallbackSummary(c), generatedAt: Date.now(), fallback: true }
+        ? { schemaVersion: 2, workspaceKey: workspaceKeyOf(p), sessionId: job.sessionId, turn: job.turn, summary: st.text, provider: st.provider, model: st.model, generatedAt: Date.now() }
+        : { schemaVersion: 2, workspaceKey: workspaceKeyOf(p), sessionId: job.sessionId, turn: job.turn, summary: fallbackSummary(c), provider: '', model: '', generatedAt: Date.now(), fallback: true }
       summaries.set(key, value)
       if (table) { try { await table.put(key, value) } catch (e) { console.error('[git-graph] persist summary failed', e) } }
     } catch (e) { console.error('[git-graph] summary job failed', e) }
   }
   async function callLlm(c) {
     try {
-      const sel = AM.currentSelection()
-      if (!sel || !sel.provider || !sel.model) return null
+      const sel = currentModel()
+      if (!sel.provider || !sel.model) return null
       const prompt = c.firstUser.slice(0, 1200) || '（无用户文本）'
       const reply = c.ass.slice(0, 2000) || '（无回复文本）'
       const messages = [
@@ -170,7 +199,7 @@ export function apply(ctx) {
         if (chunk && chunk.type === 'finish') break
       }
       const trimmed = out.trim()
-      return trimmed.length > 0 ? trimmed.slice(0, 600) : null
+      return trimmed.length > 0 ? { text: trimmed.slice(0, 600), provider: sel.provider, model: sel.model } : null
     } catch (e) { console.error('[git-graph] llm summary failed', e); return null }
   }
 
@@ -179,6 +208,7 @@ export function apply(ctx) {
   ctx.on('session/event', (session, event) => {
     const id = session && session.id
     if (!id) return
+    invalidateProject(id)
     if (event.type === 'turn/start') { live.set(id, { turn: event.data.turn, userSeq: 0, firstUser: '', human: false, ass: '' }); return }
     const cur = live.get(id)
     if (!cur) return
@@ -191,10 +221,19 @@ export function apply(ctx) {
       const t = textOf(event.data.message && event.data.message.content, 1400)
       if (t) cur.ass = cur.ass ? cur.ass + '\n' + t.slice(0, 900) : t.slice(0, 900)
     } else if (event.type === 'turn/end') {
-      if (cur.userSeq) enqueueSummary(id, cur.turn)
+      if (cur.userSeq) {
+        shouldAutoSummary(id).then((enabled) => { if (enabled) enqueueSummary(id, cur.turn) }).catch(() => {})
+      }
       live.delete(id)
     }
   })
+
+  async function shouldAutoSummary(sessionId) {
+    const p = await loadProject(sessionId)
+    if (p.error) return false
+    const cfg = settings.get(workspaceKeyOf(p))
+    return !!(cfg && cfg.autoSummary)
+  }
 
   // ---------- information-object extraction (merge) ----------
   const IO_SYSTEM = '你是一个信息对象萃取器（information-object）。把下面的会话提交（每条 = 用户请求 + 完成要点）相对合并目标 B 萃取为一个严格 JSON 对象。规则：' +
@@ -207,8 +246,8 @@ export function apply(ctx) {
 
   async function llmText(messages, maxTokens, system) {
     try {
-      const sel = AM.currentSelection()
-      if (!sel || !sel.provider || !sel.model) return null
+      const sel = currentModel()
+      if (!sel.provider || !sel.model) return null
       const opts = { provider: sel.provider, model: sel.model, messages, maxTokens }
       if (system) opts.system = system
       let out = ''
@@ -216,7 +255,8 @@ export function apply(ctx) {
         if (chunk && chunk.type === 'text-delta' && typeof chunk.text === 'string') out += chunk.text
         if (chunk && chunk.type === 'finish') break
       }
-      return out.trim() || null
+      const text = out.trim()
+      return text ? { text, provider: sel.provider, model: sel.model } : null
     } catch (e) { console.error('[git-graph] llm call failed', e); return null }
   }
 
@@ -243,9 +283,9 @@ export function apply(ctx) {
     const lines = diffCommits.map((c, i) => ('【' + (i + 1) + '】请求：' + (c.userText || '') + '\n要点：' + (c.summary || '（无）'))).join('\n\n')
     const user = '合并目标 B：' + (bTitle || '') + '\n\n' + lines
     const messages = [{ id: rid(), role: 'user', content: [{ type: 'text', text: user }], source: { kind: 'user' } }]
-    const text = await llmText(messages, 900, IO_SYSTEM)
-    if (text) {
-      const json = parseJsonLenient(text)
+    const generated = await llmText(messages, 900, IO_SYSTEM)
+    if (generated) {
+      const json = parseJsonLenient(generated.text)
       if (json && typeof json === 'object') {
         return {
           purpose: String(json.purpose || '').slice(0, 200),
@@ -253,6 +293,7 @@ export function apply(ctx) {
           negativeConstraints: (Array.isArray(json.negativeConstraints) ? json.negativeConstraints : []).slice(0, 30).map(normProp),
           openQuestions: (Array.isArray(json.openQuestions) ? json.openQuestions : []).map(String).slice(0, 20),
           deliberateExclusions: (Array.isArray(json.deliberateExclusions) ? json.deliberateExclusions : []).map(String).slice(0, 20),
+          generatedBy: { provider: generated.provider, model: generated.model, at: Date.now() },
         }
       }
     }
@@ -283,21 +324,31 @@ export function apply(ctx) {
     const B = branchById.get(m.targetB)
     return {
       id: m.id,
-      key: 'mg:' + m.id,
+      key: m.key || ('mg:' + m.id),
+      schemaVersion: 2,
+      workspaceKey: m.workspaceKey,
       sourceA: m.sourceA,
       targetB: m.targetB,
       lcaKey: m.lcaKey,
+      mergeBaseKeys: m.mergeBaseKeys || (m.lcaKey ? [m.lcaKey] : []),
       sourceHeadKey: m.sourceHeadKey,
-      headBeforeB: m.headBeforeB,
+      targetParentKey: m.targetParentKey || m.headBeforeB,
+      parentKeys: m.parentKeys || [m.targetParentKey || m.headBeforeB, m.sourceHeadKey].filter(Boolean),
+      headBeforeB: m.targetParentKey || m.headBeforeB,
       time: m.createdAt,
       status: m.status,
-      injected: !!m.injected,
+      injected: m.injectionState === 'active',
+      injectionState: m.injectionState || (m.injected ? 'active' : 'inactive'),
+      legacyInjectedMessage: !!m.legacyInjectedMessage,
+      revertedBy: m.revert ? m.revert.key : null,
+      revert: m.revert ? { id: m.revert.id, key: m.revert.key || ('rv:' + m.revert.id), parentKey: m.revert.parentKey, time: m.revert.createdAt, legacy: !!m.revert.legacy } : null,
       sourceTitle: A ? A.title : '',
       targetTitle: B ? B.title : '',
       title: m.io && m.io.purpose ? firstLine(m.io.purpose, 40) : '合并',
       summary: renderIoText(m),
       io: m.io,
-      diffKeys: m.diffKeys || [],
+      diffKeys: m.diffKeys || m.deltaKeys || [],
+      deltaKeys: m.deltaKeys || m.diffKeys || [],
       diffTurns: m.diffTurns || [],
     }
   }
@@ -318,9 +369,10 @@ export function apply(ctx) {
     const io = m.io || {}
     const diffTurns = m.diffTurns || []
     const n = diffTurns.length
+    const mergeBases = m.mergeBaseKeys || (m.lcaKey ? [m.lcaKey] : [])
     const parts = []
     parts.push('【分支合入】「' + (m.sourceTitle || '') + '」已合入本分支「' + (m.targetTitle || '') + '」——这不是任务指令，而是被合入分支的入口：')
-    parts.push('共同祖先 #' + (m.lcaKey ? turnLabelOf(m.lcaKey) : '无') + '，并入 ' + n + ' 个差分提交：' + (n ? diffTurns.map((t) => '#' + t).join('、') : '（空）') + '。')
+    parts.push('最近公共祖先集：' + (mergeBases.length ? mergeBases.map((key) => '#' + turnLabelOf(key)).join('、') : '无') + '；并入 ' + n + ' 个差分提交：' + (n ? diffTurns.map((t) => '#' + t).join('、') : '（空）') + '。')
     if (io.purpose) parts.push('目的：' + io.purpose)
     const tops = (io.propositions || []).slice(0, 5).map((p, i) => '- [' + ((p.ground && p.ground.kind) || 'inferred') + '] ' + p.claim + '（来源 ' + evTurnOf(p, i, diffTurns) + '）')
     if (tops.length) parts.push('要点：' + tops.join(' '))
@@ -343,12 +395,19 @@ export function apply(ctx) {
     }
     const roots = new Map()
     for (const b of p.branches) roots.set(b.id, rootOf(b.id))
-    const activeM = [...merges.values()].filter((m) => m.status === 'active')
+    const activeM = (p.projectMerges || []).filter((m) => m.status === 'active')
     for (const b of p.branches) {
       const root = roots.get(b.id)
       const siblings = p.branches.filter((x) => x.id !== b.id && roots.get(x.id) === root).map((x) => x.title)
       const mergesIn = activeM.filter((m) => m.targetB === b.id && byBranch.has(m.sourceA)).map((m) => byBranch.get(m.sourceA).title)
       const mergesOut = activeM.filter((m) => m.sourceA === b.id && byBranch.has(m.targetB)).map((m) => byBranch.get(m.targetB).title)
+      const injectedIds = new Set(activeInjectedMergeIds(p.dag, b.effectiveHeadKey))
+      const injectedEntries = (p.projectMerges || [])
+        .filter((m) => injectedIds.has(m.id))
+        .map((m) => renderMergeEntry(serializeMerge(m, p.branchById)))
+      const legacyRevoked = (p.projectMerges || [])
+        .filter((m) => m.targetB === b.id && m.status === 'reverted' && m.legacyInjectedMessage)
+        .map((m) => m.id)
       const parent = b.parentId && byBranch.has(b.parentId) ? byBranch.get(b.parentId) : null
       let forkTitle = null
       if (b.commitCount > 0 && b.chain.length > b.commitCount) {
@@ -365,6 +424,8 @@ export function apply(ctx) {
         siblingTitles: siblings,
         mergesIn,
         mergesOut,
+        injectedEntries,
+        legacyRevoked,
       })
     }
   }
@@ -376,12 +437,32 @@ export function apply(ctx) {
     if (f.siblingTitles.length) parts.push('同树其他分支：' + f.siblingTitles.join('、') + '。')
     if (f.mergesIn.length) parts.push('已合入本分支：' + f.mergesIn.join('、') + '。')
     if (f.mergesOut.length) parts.push('本分支已合入：' + f.mergesOut.join('、') + '。')
-    parts.push('会话中的【分支合入】消息是已并入的可追溯结论（非待执行任务）；可用 session_graph_view/read 溯源，右侧「Git 图谱」侧栏可视化同一结构。')
+    parts.push('合入采用会话信息 DAG；可用 session_graph_view/read 溯源，右侧「Git 图谱」侧栏可视化同一结构。')
+    if (f.legacyRevoked.length) parts.push('旧版聊天记录中 merge ' + f.legacyRevoked.join('、') + ' 已被 Git revert；其历史入口不得视为当前有效信息。')
+    if (f.injectedEntries.length) {
+      const cap = 4000
+      let used = 0
+      let omitted = 0
+      for (const entry of f.injectedEntries) {
+        if (used + entry.length > cap) { omitted++; continue }
+        parts.push(entry)
+        used += entry.length
+      }
+      if (omitted) parts.push('另有 ' + omitted + ' 个有效合入入口未常驻展开；用 session_graph_view/read 按需读取。')
+    }
     return parts.join('\n')
   }
 
   // ---------- project corpus (shared by graph & merge) ----------
+  function invalidateProject(sessionId) {
+    const cached = projectCache.get(sessionId)
+    if (!cached) return
+    for (const id of cached.members || []) projectCache.delete(id)
+  }
+
   async function loadProject(targetId) {
+    const cached = projectCache.get(targetId)
+    if (cached && cached.expiresAt > Date.now()) return cached.value
     const records = await Q.listSessions()
     const byId = new Map()
     for (const r of records) byId.set(r.header.id, r)
@@ -488,8 +569,50 @@ export function apply(ctx) {
       branchById.set(id, branch)
     }
 
-    updateFrames({ byId, ws, cwd, safeMembers, memberSet, titles, seedLengths, native, commitByKey, branches, branchById })
-    return { byId, ws, cwd, safeMembers, memberSet, titles, seedLengths, native, commitByKey, branches, branchById }
+    const p = { byId, ws, cwd, safeMembers, memberSet, titles, seedLengths, native, commitByKey, branches, branchById }
+    p.workspaceKey = workspaceKeyOf(p)
+    p.projectMerges = []
+    for (const m of merges.values()) {
+      if (!m || !branchById.has(m.sourceA) || !branchById.has(m.targetB)) continue
+      if (m.workspaceKey && m.workspaceKey !== p.workspaceKey) continue
+      let changed = false
+      if (!m.workspaceKey) { m.workspaceKey = p.workspaceKey; changed = true }
+      if (m.schemaVersion !== 2) { m.schemaVersion = 2; changed = true }
+      if (!m.key) { m.key = 'mg:' + m.id; changed = true }
+      if (!m.targetParentKey) { m.targetParentKey = m.headBeforeB || null; changed = true }
+      if (!Array.isArray(m.parentKeys)) { m.parentKeys = [m.targetParentKey, m.sourceHeadKey].filter(Boolean); changed = true }
+      if (!Array.isArray(m.mergeBaseKeys)) { m.mergeBaseKeys = m.lcaKey ? [m.lcaKey] : []; changed = true }
+      if (!Array.isArray(m.deltaKeys)) { m.deltaKeys = Array.isArray(m.diffKeys) ? m.diffKeys.slice() : []; changed = true }
+      if (!m.injectionState) {
+        if (m.injected && !m.dynamicInjection) {
+          m.legacyInjectedMessage = true
+          m.injected = false
+          m.injectionState = 'inactive'
+        } else {
+          m.injectionState = m.injected ? 'active' : 'inactive'
+        }
+        changed = true
+      }
+      if (m.status === 'reverted' && !(m.revert && m.revert.id)) {
+        const revertId = 'legacy-' + m.id
+        m.revert = { id: revertId, key: 'rv:' + revertId, parentKey: m.key, createdAt: (Number(m.createdAt) || 0) + 1, legacy: true }
+        m.injectionState = 'inactive'
+        changed = true
+      }
+      if (changed && mergeTable) mergeTable.put(m.id, m).catch((e) => console.error('[git-graph] merge migration persist failed', e))
+      p.projectMerges.push(m)
+    }
+    p.dag = buildInformationDag({ branches, commitByKey, merges: p.projectMerges })
+    assertDagInvariants(p.dag)
+    for (const b of branches) {
+      b.nativeHeadKey = p.dag.nativeHeads.get(b.id) || null
+      b.effectiveHeadKey = p.dag.branchHeads.get(b.id) || b.nativeHeadKey
+      b.headKey = b.effectiveHeadKey
+    }
+    updateFrames(p)
+    const cacheEntry = { value: p, members: safeMembers.slice(), expiresAt: Date.now() + 120000 }
+    for (const id of safeMembers) projectCache.set(id, cacheEntry)
+    return p
   }
 
   function serializeCommits(p) {
@@ -520,18 +643,17 @@ export function apply(ctx) {
     return commits
   }
   function serializeMerges(p) {
-    const activeMerges = []
-    for (const m of merges.values()) {
-      if (m.status !== 'active') continue
-      if (!p.branchById.has(m.targetB) || !p.branchById.has(m.sourceA)) continue
-      activeMerges.push(serializeMerge(m, p.branchById))
+    const projectMerges = []
+    for (const m of p.projectMerges || []) {
+      projectMerges.push(serializeMerge(m, p.branchById))
     }
-    activeMerges.sort((a, b) => (a.time || 0) - (b.time || 0))
-    return activeMerges
+    projectMerges.sort((a, b) => (a.time || 0) - (b.time || 0))
+    return projectMerges
   }
   function projectLabel(p) {
     return {
       id: p.ws ? p.ws.id : '',
+      key: p.workspaceKey || workspaceKeyOf(p),
       path: p.ws ? p.ws.path : (p.cwd || ''),
       title: p.ws ? p.ws.title : (p.cwd ? (p.cwd.split('/').filter(Boolean).pop() || p.cwd) : '未命名项目'),
     }
@@ -540,101 +662,184 @@ export function apply(ctx) {
   async function buildGraph(targetId) {
     const p = await loadProject(targetId)
     if (p.error) return { error: p.error }
+    const cfg = settings.get(p.workspaceKey) || { autoSummary: false }
+    const model = currentModel()
     return {
       workspace: projectLabel(p),
       branches: p.branches,
       commits: serializeCommits(p),
       merges: serializeMerges(p),
+      reverts: serializeMerges(p).filter((m) => m.revert).map((m) => ({ ...m.revert, mergeId: m.id, targetB: m.targetB, title: 'Revert ' + m.title })),
+      privacy: { autoSummary: !!cfg.autoSummary, provider: model.provider, model: model.model },
       current: targetId,
       generatedAt: Date.now(),
     }
   }
 
   // ---------- merge pipeline ----------
-  async function mergeFor(source, target) {
-    if (typeof source !== 'string' || typeof target !== 'string' || !source || !target) return { ok: false, code: 'bad-args' }
-    const p = await loadProject(target)
-    if (p.error) return { ok: false, code: p.error }
-    if (source === target) return { ok: false, code: 'self' }
-    const A = p.branchById.get(source)
-    const B = p.branchById.get(target)
-    if (!A || !B) return { ok: false, code: 'not-found' }
-    const rootOf = (b) => {
-      let c = b
-      let hops = 0
-      while (c.parentId && p.branchById.get(c.parentId) && hops < 64) { c = p.branchById.get(c.parentId); hops++ }
-      return c.id
+  const mergeLocks = new Map()
+  async function withMergeLock(key, work) {
+    const previous = mergeLocks.get(key) || Promise.resolve()
+    let release
+    const marker = new Promise((resolve) => { release = resolve })
+    const queued = previous.catch(() => {}).then(() => marker)
+    mergeLocks.set(key, queued)
+    await previous.catch(() => {})
+    try { return await work() }
+    finally {
+      release()
+      if (mergeLocks.get(key) === queued) mergeLocks.delete(key)
     }
-    if (rootOf(A) !== rootOf(B)) return { ok: false, code: 'unrelated' }
-    let i = 0
-    while (i < A.chain.length && i < B.chain.length && A.chain[i] === B.chain[i]) i++
-    if (i === A.chain.length) return { ok: false, code: 'already-contained' }
-    const lcaKey = i > 0 ? A.chain[i - 1] : null
-    const diffKeys = A.chain.slice(i)
-    if (diffKeys.length === 0) return { ok: false, code: 'no-effective-increment' }
-    const existing = [...merges.values()].find((m) => m.sourceA === source && m.targetB === target && m.status === 'active')
-    if (existing) return { ok: true, merge: serializeMerge(existing, p.branchById), dedup: true }
-    const diffCommits = diffKeys.map((k) => p.commitByKey.get(k)).filter(Boolean).map((c) => ({
-      key: c.key,
-      turn: c.turn,
-      userText: c.firstUser,
-      summary: (summaries.get(c.key) || {}).summary || '',
-    }))
-    const io = await extractIo(diffCommits, B.title)
-    if (!io) return { ok: false, code: 'llm-failed' }
-    if (!io.propositions.length && !io.negativeConstraints.length && !io.openQuestions.length) return { ok: false, code: 'no-effective-increment' }
-    const rec = {
-      id: 'mg-' + Math.random().toString(36).slice(2, 12),
-      sourceA: source,
-      targetB: target,
-      lcaKey,
-      sourceHeadKey: A.chain.length ? A.chain[A.chain.length - 1] : null,
-      headBeforeB: B.chain.length ? B.chain[B.chain.length - 1] : null,
-      createdAt: Date.now(),
-      status: 'active',
-      injected: false,
-      io,
-      diffKeys,
-      diffTurns: diffCommits.map((c) => c.turn),
-    }
-    merges.set(rec.id, rec)
-    if (mergeTable) { try { await mergeTable.put(rec.id, rec) } catch (e) { console.error('[git-graph] merge persist failed', e) } }
-    updateFrames(p)
-    return { ok: true, merge: serializeMerge(rec, p.branchById) }
   }
 
-  async function revertFor(mergeId) {
-    const m = merges.get(mergeId)
-    if (!m) return { ok: false, code: 'not-found' }
-    if (m.status === 'reverted') return { ok: false, code: 'already-reverted' }
+  function rootBranchId(branch, branchById) {
+    let cur = branch
+    let hops = 0
+    while (cur && cur.parentId && branchById.get(cur.parentId) && hops < 64) { cur = branchById.get(cur.parentId); hops++ }
+    return cur ? cur.id : null
+  }
+
+  function diffEntries(p, keys) {
+    const out = []
+    for (const key of keys) {
+      const node = p.dag.nodes.get(key)
+      if (!node) continue
+      if (node.kind === 'commit') {
+        const c = p.commitByKey.get(key)
+        if (!c) continue
+        out.push({ key, turn: c.turn, userText: c.firstUser, summary: (summaries.get(key) || {}).summary || '' })
+      } else if (node.kind === 'merge') {
+        const m = node.record || {}
+        out.push({ key, turn: null, userText: '传递合入 ' + key, summary: renderIoText(m) })
+      } else if (node.kind === 'revert') {
+        out.push({ key, turn: null, userText: 'Git revert ' + node.mergeId, summary: '撤销对应合入对当前上下文的作用，保留其祖先关系。' })
+      }
+    }
+    return out
+  }
+
+  async function mergeFor(callerSessionId, source, target) {
+    if (typeof callerSessionId !== 'string' || typeof source !== 'string' || typeof target !== 'string' || !source || !target) return { ok: false, code: 'bad-args' }
+    const initial = await loadProject(callerSessionId)
+    if (initial.error) return { ok: false, code: initial.error }
+    if (!initial.branchById.has(source) || !initial.branchById.has(target)) return { ok: false, code: 'workspace-mismatch' }
+    const lockKey = initial.workspaceKey + '|' + source + '|' + target
+    return await withMergeLock(lockKey, async () => {
+      const p = await loadProject(callerSessionId)
+      if (p.error) return { ok: false, code: p.error }
+      if (source === target) return { ok: false, code: 'self' }
+      const A = p.branchById.get(source)
+      const B = p.branchById.get(target)
+      if (!A || !B) return { ok: false, code: 'workspace-mismatch' }
+      if (rootBranchId(A, p.branchById) !== rootBranchId(B, p.branchById)) return { ok: false, code: 'unrelated' }
+      const sourceHead = p.dag.branchHeads.get(source)
+      const targetHead = p.dag.branchHeads.get(target)
+      if (!sourceHead) return { ok: false, code: 'no-effective-increment' }
+      const deltaKeys = p.dag.delta(sourceHead, targetHead)
+      if (deltaKeys.length === 0) {
+        // A concurrent or repeated request may observe the merge node produced
+        // by the first request as its new target head. Reuse that result rather
+        // than creating an empty merge or reporting a misleading failure.
+        const absorbed = [...(p.projectMerges || [])].reverse().find((m) =>
+          m.sourceA === source && m.targetB === target && m.sourceHeadKey === sourceHead)
+        if (absorbed) return { ok: true, merge: serializeMerge(absorbed, p.branchById), dedup: true }
+        return { ok: false, code: 'already-contained' }
+      }
+      const existing = (p.projectMerges || []).find((m) => m.sourceA === source && m.targetB === target && m.sourceHeadKey === sourceHead && (m.targetParentKey || m.headBeforeB) === targetHead)
+      if (existing) return { ok: true, merge: serializeMerge(existing, p.branchById), dedup: true }
+      const entries = diffEntries(p, deltaKeys)
+      if (entries.length === 0) return { ok: false, code: 'no-effective-increment' }
+      const io = await extractIo(entries, B.title)
+      if (!io || (!io.propositions.length && !io.negativeConstraints.length && !io.openQuestions.length)) return { ok: false, code: 'no-effective-increment' }
+      const mergeBaseKeys = p.dag.mergeBases(sourceHead, targetHead)
+      const createdAt = Date.now()
+      const rec = {
+        schemaVersion: 2,
+        id: 'mg-' + Math.random().toString(36).slice(2, 12),
+        workspaceKey: p.workspaceKey,
+        sourceA: source,
+        targetB: target,
+        sourceHeadKey: sourceHead,
+        targetParentKey: targetHead || null,
+        headBeforeB: targetHead || null,
+        parentKeys: [targetHead, sourceHead].filter(Boolean),
+        mergeBaseKeys,
+        lcaKey: mergeBaseKeys.length === 1 ? mergeBaseKeys[0] : null,
+        createdAt,
+        causalOrder: createdAt,
+        status: 'active',
+        injected: false,
+        injectionState: 'inactive',
+        dynamicInjection: true,
+        io,
+        deltaKeys,
+        diffKeys: deltaKeys,
+        diffTurns: entries.filter((entry) => entry.turn !== null).map((entry) => entry.turn),
+      }
+      rec.key = 'mg:' + rec.id
+      merges.set(rec.id, rec)
+      if (mergeTable) { try { await mergeTable.put(rec.id, rec) } catch (e) { console.error('[git-graph] merge persist failed', e) } }
+      invalidateProject(callerSessionId)
+      const updated = await loadProject(callerSessionId)
+      return { ok: true, merge: serializeMerge(rec, updated.error ? p.branchById : updated.branchById) }
+    })
+  }
+
+  async function scopedMerge(callerSessionId, mergeId) {
+    if (typeof callerSessionId !== 'string' || typeof mergeId !== 'string') return { error: 'bad-args' }
+    const p = await loadProject(callerSessionId)
+    if (p.error) return { error: p.error }
+    const m = (p.projectMerges || []).find((item) => item.id === mergeId)
+    if (!m || m.workspaceKey !== p.workspaceKey) return { error: 'workspace-mismatch' }
+    return { p, m }
+  }
+
+  async function persistMergeAndRefresh(callerSessionId, m) {
+    if (mergeTable) await mergeTable.put(m.id, m)
+    invalidateProject(callerSessionId)
+    await loadProject(callerSessionId)
+  }
+
+  async function revertFor(callerSessionId, mergeId) {
+    const scoped = await scopedMerge(callerSessionId, mergeId)
+    if (scoped.error) return { ok: false, code: scoped.error }
+    const { p, m } = scoped
+    if (m.revert && m.revert.id) return { ok: true, revert: m.revert, dedup: true }
+    const parentKey = p.dag.branchHeads.get(m.targetB)
+    const createdAt = Date.now()
+    const revertId = 'rv-' + Math.random().toString(36).slice(2, 12)
+    m.revert = { id: revertId, key: 'rv:' + revertId, parentKey, createdAt, causalOrder: createdAt, revertsMergeId: m.id }
     m.status = 'reverted'
-    if (mergeTable) { try { await mergeTable.put(mergeId, m) } catch (e) { console.error('[git-graph] merge revert persist failed', e) } }
-    try { await loadProject(m.targetB) } catch (e) { /* frames refresh best-effort */ }
+    m.injected = false
+    m.injectionState = 'inactive'
+    try { await persistMergeAndRefresh(callerSessionId, m) }
+    catch (e) { console.error('[git-graph] merge revert persist failed', e); return { ok: false, code: 'persist-failed' } }
+    return { ok: true, revert: m.revert }
+  }
+
+  async function injectFor(callerSessionId, mergeId) {
+    const scoped = await scopedMerge(callerSessionId, mergeId)
+    if (scoped.error) return { ok: false, code: scoped.error }
+    const { m } = scoped
+    if (m.status !== 'active' || m.revert) return { ok: false, code: 'reverted' }
+    if (m.injectionState === 'active' && m.dynamicInjection) return { ok: true, dedup: true }
+    m.injected = true
+    m.injectionState = 'active'
+    m.dynamicInjection = true
+    try { await persistMergeAndRefresh(callerSessionId, m) }
+    catch (e) { console.error('[git-graph] merge inject persist failed', e); return { ok: false, code: 'persist-failed' } }
     return { ok: true }
   }
 
-  async function injectFor(mergeId) {
-    const m = merges.get(mergeId)
-    if (!m) return { ok: false, code: 'not-found' }
-    if (m.status !== 'active') return { ok: false, code: 'reverted' }
-    const session = SESS.get(m.targetB)
-    if (!session) return { ok: false, code: 'target-not-live', hint: '打开受体分支后再注入' }
-    let view = m
-    const p = await loadProject(m.targetB)
-    if (!p.error) view = serializeMerge(m, p.branchById)
-    const msg = {
-      id: 'sgm-' + Math.random().toString(36).slice(2, 12),
-      role: 'user',
-      content: [{ type: 'text', text: renderMergeEntry(view) }],
-      source: { kind: 'plugin', plugin: 'dsh-session-graph', form: 'recall' },
-    }
-    try {
-      session.append('user/message', msg, { surfaceOp: 'append' })
-    } catch (e) {
-      return { ok: false, code: 'append-failed', detail: String((e && e.message) || e) }
-    }
-    m.injected = true
-    if (mergeTable) { try { await mergeTable.put(mergeId, m) } catch (e) { /* ignore */ } }
+  async function uninjectFor(callerSessionId, mergeId) {
+    const scoped = await scopedMerge(callerSessionId, mergeId)
+    if (scoped.error) return { ok: false, code: scoped.error }
+    const { m } = scoped
+    if (m.injectionState !== 'active') return { ok: true, dedup: true }
+    m.injected = false
+    m.injectionState = 'inactive'
+    try { await persistMergeAndRefresh(callerSessionId, m) }
+    catch (e) { console.error('[git-graph] merge uninject persist failed', e); return { ok: false, code: 'persist-failed' } }
     return { ok: true }
   }
 
@@ -645,10 +850,12 @@ export function apply(ctx) {
       const snap = await Q.readSession(sessionId)
       const c = extractCommits(snap.events).find((x) => x.turn === turn)
       if (!c) return { ok: false, error: 'commit-not-found' }
+      const p = await loadProject(sessionId)
+      if (p.error) return { ok: false, error: p.error }
       const st = await callLlm(c)
       const value = st
-        ? { sessionId, turn, summary: st, generatedAt: Date.now() }
-        : { sessionId, turn, summary: fallbackSummary(c), generatedAt: Date.now(), fallback: true }
+        ? { schemaVersion: 2, workspaceKey: p.workspaceKey, sessionId, turn, summary: st.text, provider: st.provider, model: st.model, generatedAt: Date.now() }
+        : { schemaVersion: 2, workspaceKey: p.workspaceKey, sessionId, turn, summary: fallbackSummary(c), provider: '', model: '', generatedAt: Date.now(), fallback: true }
       summaries.set(sessionId + ':' + turn, value)
       if (table) { try { await table.put(sessionId + ':' + turn, value) } catch (e) { console.error('[git-graph] persist summary failed', e) } }
       return { ok: true, summary: value.summary, fallback: !!value.fallback }
@@ -656,6 +863,64 @@ export function apply(ctx) {
       console.error('[git-graph] summarize failed', e)
       return { ok: false, error: String((e && e.message) || e) }
     }
+  }
+
+  async function settingsFor(sessionId) {
+    const p = await loadProject(sessionId)
+    if (p.error) return { ok: false, code: p.error }
+    const cfg = settings.get(p.workspaceKey) || { autoSummary: false }
+    return { ok: true, workspaceKey: p.workspaceKey, autoSummary: !!cfg.autoSummary, ...currentModel() }
+  }
+
+  async function updateSettingsFor(sessionId, autoSummary) {
+    if (typeof autoSummary !== 'boolean') return { ok: false, code: 'bad-args' }
+    const p = await loadProject(sessionId)
+    if (p.error) return { ok: false, code: p.error }
+    const value = { schemaVersion: 2, workspaceKey: p.workspaceKey, autoSummary, updatedAt: Date.now() }
+    settings.set(p.workspaceKey, value)
+    if (settingsTable) {
+      try { await settingsTable.put(p.workspaceKey, value) }
+      catch (e) { console.error('[git-graph] settings persist failed', e); return { ok: false, code: 'persist-failed' } }
+    }
+    return { ok: true, ...value, ...currentModel() }
+  }
+
+  async function purgeFor(sessionId, args) {
+    const p = await loadProject(sessionId)
+    if (p.error) return { ok: false, code: p.error }
+    const purgeSummaries = !args || args.summaries !== false
+    const purgeMerges = !args || args.merges !== false
+    const purgeSettings = !!(args && args.settings)
+    const removed = { summaries: 0, merges: 0, settings: 0 }
+    try {
+      if (purgeSummaries) {
+        for (const [key, value] of [...summaries.entries()]) {
+          const belongs = value && value.workspaceKey ? value.workspaceKey === p.workspaceKey : p.memberSet.has(value && value.sessionId)
+          if (!belongs) continue
+          summaries.delete(key)
+          await deleteStored(table, key)
+          removed.summaries++
+        }
+      }
+      if (purgeMerges) {
+        for (const m of [...(p.projectMerges || [])]) {
+          merges.delete(m.id)
+          await deleteStored(mergeTable, m.id)
+          removed.merges++
+        }
+      }
+      if (purgeSettings && settings.has(p.workspaceKey)) {
+        settings.delete(p.workspaceKey)
+        await deleteStored(settingsTable, p.workspaceKey)
+        removed.settings++
+      }
+    } catch (e) {
+      console.error('[git-graph] purge failed', e)
+      return { ok: false, code: 'purge-failed', detail: String((e && e.message) || e), removed }
+    }
+    invalidateProject(sessionId)
+    await loadProject(sessionId)
+    return { ok: true, removed }
   }
 
   // ---------- HTTP routes (loopback fenced, same-origin JSON) ----------
@@ -671,7 +936,12 @@ export function apply(ctx) {
   }
   async function readJsonBody(req) {
     let body = ''
-    try { for await (const chunk of req) body += chunk } catch { return null }
+    try {
+      for await (const chunk of req) {
+        body += chunk
+        if (body.length > 65536) return null
+      }
+    } catch { return null }
     try { return JSON.parse(body) } catch { return null }
   }
   ctx.effect(() => ctx.webServer.register({
@@ -695,17 +965,37 @@ export function apply(ctx) {
       if (req.method === 'POST' && url.pathname === '/sgx/merge') {
         await domainReady
         const args = await readJsonBody(req)
-        return json(res, 200, await mergeFor(args && args.sourceA, args && args.targetB))
+        return json(res, 200, await mergeFor(args && args.sessionId, args && args.sourceA, args && args.targetB))
       }
       if (req.method === 'POST' && url.pathname === '/sgx/merge/revert') {
         await domainReady
         const args = await readJsonBody(req)
-        return json(res, 200, await revertFor(args && args.mergeId))
+        return json(res, 200, await revertFor(args && args.sessionId, args && args.mergeId))
       }
       if (req.method === 'POST' && url.pathname === '/sgx/merge/inject') {
         await domainReady
         const args = await readJsonBody(req)
-        return json(res, 200, await injectFor(args && args.mergeId))
+        return json(res, 200, await injectFor(args && args.sessionId, args && args.mergeId))
+      }
+      if (req.method === 'POST' && url.pathname === '/sgx/merge/uninject') {
+        await domainReady
+        const args = await readJsonBody(req)
+        return json(res, 200, await uninjectFor(args && args.sessionId, args && args.mergeId))
+      }
+      if (req.method === 'GET' && url.pathname === '/sgx/settings') {
+        await domainReady
+        const sid = url.searchParams.get('session')
+        return json(res, 200, await settingsFor(sid))
+      }
+      if (req.method === 'POST' && url.pathname === '/sgx/settings') {
+        await domainReady
+        const args = await readJsonBody(req)
+        return json(res, 200, await updateSettingsFor(args && args.sessionId, args && args.autoSummary))
+      }
+      if (req.method === 'POST' && url.pathname === '/sgx/purge') {
+        await domainReady
+        const args = await readJsonBody(req)
+        return json(res, 200, await purgeFor(args && args.sessionId, args))
       }
       return json(res, 404, { error: 'not-found' })
     },
@@ -733,9 +1023,9 @@ export function apply(ctx) {
       return {
         ok: true,
         workspace: projectLabel(p),
-        branches: p.branches.map((b) => ({ id: b.id, title: b.title, parentId: b.parentId, commitCount: b.commitCount, headKey: b.headKey })),
+        branches: p.branches.map((b) => ({ id: b.id, title: b.title, parentId: b.parentId, commitCount: b.commitCount, nativeHeadKey: b.nativeHeadKey, effectiveHeadKey: b.effectiveHeadKey, headKey: b.headKey })),
         commits: serializeCommits(p).map((c) => ({ key: c.key, sessionId: c.sessionId, turn: c.turn, title: c.title, time: c.time })),
-        merges: serializeMerges(p).map((m) => ({ id: m.id, key: m.key, sourceTitle: m.sourceTitle, targetTitle: m.targetTitle, title: m.title, injected: m.injected, diffTurns: m.diffTurns })),
+        merges: serializeMerges(p).map((m) => ({ id: m.id, key: m.key, sourceTitle: m.sourceTitle, targetTitle: m.targetTitle, title: m.title, status: m.status, injected: m.injected, parentKeys: m.parentKeys, mergeBaseKeys: m.mergeBaseKeys, deltaKeys: m.deltaKeys, revertedBy: m.revertedBy, diffTurns: m.diffTurns })),
         current: s.id,
       }
     },
@@ -754,9 +1044,14 @@ export function apply(ctx) {
       const target = typeof (args && args.target) === 'string' ? args.target : ''
       if (!target) return { ok: false, code: 'bad-args' }
       if (target.startsWith('mg:')) {
-        const m = merges.get(target.slice(3))
+        const m = (p.projectMerges || []).find((item) => item.id === target.slice(3))
         if (!m) return { ok: false, code: 'not-found' }
         return { ok: true, kind: 'merge', merge: serializeMerge(m, p.branchById) }
+      }
+      if (target.startsWith('rv:')) {
+        const m = (p.projectMerges || []).find((item) => item.revert && (item.revert.key === target || item.revert.id === target.slice(3)))
+        if (!m) return { ok: false, code: 'not-found' }
+        return { ok: true, kind: 'revert', revert: { ...m.revert, mergeId: m.id, targetB: m.targetB } }
       }
       const c = p.commitByKey.get(target)
       if (c) {
@@ -837,7 +1132,7 @@ export function apply(ctx) {
         targetId = s.id
       }
       if (!p.branchById.has(targetId)) return { ok: false, code: 'no-project' }
-      return await mergeFor(A.id, targetId)
+      return await mergeFor(s.id, A.id, targetId)
     },
   }
   function registerAgentSurface(agent) {

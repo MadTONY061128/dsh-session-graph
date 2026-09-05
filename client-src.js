@@ -24,7 +24,7 @@ var CSS = `
 .sgx-tree .sgx-tdot{width:7px;height:7px;border-radius:50%;flex:none}
 .sgx-tree.sgx-cur{border-color:var(--dsw-alias-brand-primary);color:var(--dsw-alias-label-primary)}
 .sgx-ttext{white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
-.sgx-head{display:flex;align-items:center;gap:8px;padding:6px 8px;flex:none;color:var(--dsw-alias-label-secondary);font-size:11px}
+.sgx-head{display:flex;align-items:center;flex-wrap:wrap;gap:6px;padding:6px 8px;flex:none;color:var(--dsw-alias-label-secondary);font-size:11px}
 .sgx-meta{white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 .sgx-grow{flex:1}
 .sgx-btn{cursor:pointer;border:1px solid var(--dsw-alias-border-l2);background:transparent;color:var(--dsw-alias-label-secondary);border-radius:8px;padding:1px 9px;font-size:11px;line-height:17px}
@@ -178,15 +178,25 @@ function layoutTree(data, treeId) {
 
   var rowOf = rowIndex
 
-  // merge cells: place each active merge directly ABOVE its target B's head.
+  // DAG operation cells: place merge/revert directly above their persisted
+  // target parent. Processing oldest-first makes repeated merges and Git
+  // reverts become a real causal chain rather than decorative rows.
   var merges = (data && data.merges) || []
   var mergeRows = []
-  merges.slice().sort(function (a, b) { return (a.time || 0) - (b.time || 0) }).forEach(function (m) {
-    if (laneOf[m.targetB] === undefined) return
-    var at = rowOf[m.headBeforeB] !== undefined ? rowOf[m.headBeforeB] : rows.length
-    rows.splice(at, 0, { kind: 'merge', key: m.key, merge: m })
+  var revertRows = []
+  var operations = []
+  merges.forEach(function (m) {
+    operations.push({ kind: 'merge', key: m.key, time: m.time || 0, targetB: m.targetB, parentKey: m.targetParentKey || m.headBeforeB, merge: m })
+    if (m.revert && m.revert.key) operations.push({ kind: 'revert', key: m.revert.key, time: m.revert.time || 0, targetB: m.targetB, parentKey: m.revert.parentKey || m.key, merge: m, revert: m.revert })
+  })
+  operations.sort(function (a, b) { return (a.time || 0) - (b.time || 0) || String(a.key).localeCompare(String(b.key)) }).forEach(function (op) {
+    if (laneOf[op.targetB] === undefined) return
+    var at = rowOf[op.parentKey] !== undefined ? rowOf[op.parentKey] : rows.length
+    rows.splice(at, 0, op)
     bumpAfter(at)
-    mergeRows.push({ key: m.key, merge: m })
+    rowOf[op.key] = at
+    if (op.kind === 'merge') mergeRows.push({ key: op.key, merge: op.merge })
+    else revertRows.push({ key: op.key, merge: op.merge, revert: op.revert })
   })
   mergeRows.forEach(function (mr) {
     for (var r2 = 0; r2 < rows.length; r2++) {
@@ -195,7 +205,13 @@ function layoutTree(data, treeId) {
     mr.targetLane = laneOf[mr.merge.targetB]
     mr.sourceLane = laneOf[mr.merge.sourceA] !== undefined ? laneOf[mr.merge.sourceA] : mr.targetLane
     mr.sourceRow = mr.merge.sourceHeadKey !== undefined && rowOf[mr.merge.sourceHeadKey] !== undefined ? rowOf[mr.merge.sourceHeadKey] : -1
-    mr.headBeforeRow = mr.merge.headBeforeB !== undefined && rowOf[mr.merge.headBeforeB] !== undefined ? rowOf[mr.merge.headBeforeB] : -1
+    var targetParentKey = mr.merge.targetParentKey || mr.merge.headBeforeB
+    mr.headBeforeRow = targetParentKey !== undefined && rowOf[targetParentKey] !== undefined ? rowOf[targetParentKey] : -1
+  })
+  revertRows.forEach(function (rr) {
+    rr.row = rowOf[rr.key] !== undefined ? rowOf[rr.key] : -1
+    rr.targetLane = laneOf[rr.merge.targetB]
+    rr.parentRow = rr.revert.parentKey && rowOf[rr.revert.parentKey] !== undefined ? rowOf[rr.revert.parentKey] : -1
   })
 
   // geom 必须在 merge 单元格插入之后计算：merge 行会 bump 后续所有行号，
@@ -241,6 +257,7 @@ function layoutTree(data, treeId) {
     commitMap: commitMap,
     geom: geom,
     mergeRows: mergeRows,
+    revertRows: revertRows,
     lanes: ordered.length,
     rowCount: rows.length,
   }
@@ -268,8 +285,8 @@ function apply(ctx) {
 
   var TAB_ID = 'dsh-session-graph'
 
-  var fetchGraph = function (sessionId) {
-    return fetch('/sgx/graph?session=' + encodeURIComponent(sessionId)).then(function (r) { return r.json() })
+  var fetchGraph = function (sessionId, signal) {
+    return fetch('/sgx/graph?session=' + encodeURIComponent(sessionId), { signal: signal }).then(function (r) { return r.json() })
   }
   var postJson = function (path, payload) {
     return fetch(path, {
@@ -310,6 +327,7 @@ function apply(ctx) {
     }
     var timerCtx = timerRef.current
     var sessionsSvc = tabCtx.get('sessions')
+    var requestRef = React.useRef({ seq: 0, controller: null })
 
     var statePair = React.useState({ data: null, error: null, loading: false })
     var state = statePair[0]
@@ -326,10 +344,17 @@ function apply(ctx) {
 
     var refresh = React.useCallback(function () {
       if (!sessionId) { setState({ data: null, error: null, loading: false }); return }
+      if (requestRef.current.controller) requestRef.current.controller.abort()
+      var controller = typeof AbortController === 'function' ? new AbortController() : null
+      var seq = ++requestRef.current.seq
+      requestRef.current.controller = controller
       setState(function (s) { return { data: s.data, error: null, loading: true } })
-      fetchGraph(sessionId).then(function (data) {
+      fetchGraph(sessionId, controller ? controller.signal : undefined).then(function (data) {
+        if (seq !== requestRef.current.seq) return
         setState({ data: data, error: data && data.error ? data.error : null, loading: false })
       }).catch(function (e) {
+        if (e && e.name === 'AbortError') return
+        if (seq !== requestRef.current.seq) return
         setState({ data: null, error: String((e && e.message) || e), loading: false })
       })
     }, [sessionId])
@@ -339,9 +364,16 @@ function apply(ctx) {
       // 卡片可见性不阻塞数据加载：面板收起时也在后台刷新，
       // 避免打开面板后长期停在「加载中…」。
       refresh()
-      if (!timerCtx) return
-      var stop = timerCtx.interval(function () { if (alive) refresh() }, 30000)
-      return function () { alive = false; stop() }
+      if (!timerCtx) return function () { alive = false; if (requestRef.current.controller) requestRef.current.controller.abort() }
+      var stop = timerCtx.interval(function () { if (alive && document.visibilityState !== 'hidden') refresh() }, 120000)
+      var onVisible = function () { if (alive && document.visibilityState === 'visible') refresh() }
+      document.addEventListener('visibilitychange', onVisible)
+      return function () {
+        alive = false
+        stop()
+        document.removeEventListener('visibilitychange', onVisible)
+        if (requestRef.current.controller) requestRef.current.controller.abort()
+      }
     }, [refresh, timerCtx])
 
     // follow the current session's tree when the session changes
@@ -375,7 +407,7 @@ function apply(ctx) {
           var c20 = L.commitMap[own0[ki0]]
           if (c20 && (c20.time || 0) > ht0) { ht0 = c20.time; hk0 = own0[ki0] }
         }
-        curInfo = { headKey: hk0, empty: (cb0.commitCount || 0) === 0, branchId: cb0.id }
+        curInfo = { headKey: cb0.effectiveHeadKey || hk0, nativeHeadKey: hk0, empty: (cb0.commitCount || 0) === 0, branchId: cb0.id }
         break
       }
     }
@@ -439,6 +471,8 @@ function apply(ctx) {
     var tipGroups = []
     var mergePaths = []
     var mergeGroups = []
+    var revertPaths = []
+    var revertGroups = []
 
     // lane lines: junction (fork point, shared with the parent) -> head
     L.geom.forEach(function (g) {
@@ -479,6 +513,7 @@ function apply(ctx) {
       var my = rowY(mr.row)
       var bColor = laneColor(mr.targetLane)
       var sColor = laneColor(mr.sourceLane !== undefined ? mr.sourceLane : 0)
+      var isCurrentMerge = curInfo && curInfo.headKey === mr.key
       if (mr.headBeforeRow >= 0) {
         mergePaths.push({ d: 'M ' + bx + ' ' + rowY(mr.headBeforeRow) + ' L ' + bx + ' ' + my, color: bColor, dashed: false })
       }
@@ -491,11 +526,25 @@ function apply(ctx) {
         // 方向箭头：源分支 S 曲线末端汇入 merge 方块（源色实心三角，朝向随源位置自适应）
         mergePaths.push({ kind: 'arrow', x: bx, y: my, dir: dir1, color: sColor })
       }
-      mergeGroups.push(React.createElement('g', { key: mr.key, className: 'sgx-mg', style: { cursor: 'pointer' }, onClick: function () { setSelKey(mr.key) } },
+      mergeGroups.push(React.createElement('g', { key: mr.key, className: 'sgx-mg', opacity: mr.merge.status === 'reverted' ? 0.55 : 1, style: { cursor: 'pointer' }, onClick: function () { setSelKey(mr.key) } },
         React.createElement('circle', { cx: bx, cy: my, r: 9, fill: 'transparent' }),
         (selKey === mr.key) && React.createElement('circle', { cx: bx, cy: my, r: 9, fill: 'none', stroke: 'var(--dsw-alias-brand-primary)', strokeWidth: 2 }),
+        isCurrentMerge && React.createElement('circle', { cx: bx, cy: my, r: 9, fill: 'none', stroke: bColor, strokeWidth: 2 }),
         React.createElement('rect', { x: bx - 4.5, y: my - 4.5, width: 9, height: 9, rx: 2, fill: bColor, stroke: 'var(--dsw-alias-bg-overlay)', strokeWidth: 1 }),
-        React.createElement('text', { x: laneEndX + 10, y: my + 4, fontSize: 11.5, fill: 'var(--dsw-alias-label-secondary)', style: { cursor: 'pointer' } }, truncate(mr.merge.title || '合并', 30))))
+        React.createElement('text', { x: laneEndX + 10, y: my + 4, fontSize: 11.5, fill: 'var(--dsw-alias-label-secondary)', style: { cursor: 'pointer' } }, truncate((mr.merge.status === 'reverted' ? '已撤销 · ' : '') + (mr.merge.title || '合并'), 30))))
+    })
+
+    L.revertRows.forEach(function (rr) {
+      if (rr.row < 0) return
+      var rx = laneX(rr.targetLane)
+      var ry = rowY(rr.row)
+      var isCurrentRevert = curInfo && curInfo.headKey === rr.key
+      if (rr.parentRow >= 0) revertPaths.push({ d: 'M ' + rx + ' ' + rowY(rr.parentRow) + ' L ' + rx + ' ' + ry })
+      revertGroups.push(React.createElement('g', { key: rr.key, className: 'sgx-rv', style: { cursor: 'pointer' }, onClick: function () { setSelKey(rr.key) } },
+        React.createElement('circle', { cx: rx, cy: ry, r: 10, fill: 'transparent' }),
+        (selKey === rr.key || isCurrentRevert) && React.createElement('circle', { cx: rx, cy: ry, r: 9, fill: 'none', stroke: 'var(--dsw-alias-state-error-primary)', strokeWidth: 2 }),
+        React.createElement('polygon', { points: rx + ',' + (ry - 5.5) + ' ' + (rx + 5.5) + ',' + ry + ' ' + rx + ',' + (ry + 5.5) + ' ' + (rx - 5.5) + ',' + ry, fill: 'var(--dsw-alias-state-error-primary)', stroke: 'var(--dsw-alias-bg-overlay)', strokeWidth: 1 }),
+        React.createElement('text', { x: laneEndX + 10, y: ry + 4, fontSize: 11.5, fill: 'var(--dsw-alias-label-secondary)', style: { cursor: 'pointer' } }, 'Git revert · ' + truncate(rr.merge.title || rr.merge.id, 22))))
     })
 
     L.rows.forEach(function (cell, ri) {
@@ -517,7 +566,7 @@ function apply(ctx) {
           isCur && React.createElement('circle', { cx: dx, cy: y, r: 8, fill: 'none', stroke: dcolor, strokeWidth: 2 }),
           React.createElement('circle', { cx: dx, cy: y, r: 4.5, fill: dcolor, stroke: 'var(--dsw-alias-bg-overlay)', strokeWidth: 1 }),
           React.createElement('text', { x: laneEndX + 10, y: y + 4, fontSize: 11.5, fill: isCur ? 'var(--dsw-alias-label-primary)' : 'var(--dsw-alias-label-secondary)', style: { cursor: 'pointer' } }, truncate(c.title, 30))))
-      } else {
+      } else if (cell.kind === 'tip') {
         var g = null
         for (var ti = 0; ti < L.geom.length; ti++) if (L.geom[ti].id === cell.branchId) { g = L.geom[ti]; break }
         if (!g) return
@@ -555,7 +604,7 @@ function apply(ctx) {
     var mergeIntoCurrent = function (branchId) {
       if (busy || !currentBranchId) return
       setBusy('merge')
-      postJson('/sgx/merge', { sourceA: branchId, targetB: currentBranchId }).then(function (r) {
+      postJson('/sgx/merge', { sessionId: sessionId, sourceA: branchId, targetB: currentBranchId }).then(function (r) {
         if (r && r.ok) refresh()
         else setState(function (s) { return { data: s.data, error: r && r.code ? mergeErrText(r.code) : '合并失败', loading: false } })
       }).catch(function (e) {
@@ -565,16 +614,42 @@ function apply(ctx) {
     var revertMerge = function (m) {
       if (busy) return
       setBusy('revert')
-      postJson('/sgx/merge/revert', { mergeId: m.id }).then(function () { refresh() }).finally(function () { setBusy(null) })
+      postJson('/sgx/merge/revert', { sessionId: sessionId, mergeId: m.id }).then(function () { refresh() }).finally(function () { setBusy(null) })
     }
     var injectMerge = function (m) {
       if (busy) return
       setBusy('inject')
-      postJson('/sgx/merge/inject', { mergeId: m.id }).then(function (r) {
+      postJson('/sgx/merge/inject', { sessionId: sessionId, mergeId: m.id }).then(function (r) {
         if (r && r.ok) { setState(function (s) { return { data: s.data, error: null, loading: false } }); refresh() }
-        else setState(function (s) { return { data: s.data, error: r && r.code === 'target-not-live' ? (r.hint || '请先打开受体分支') : '注入失败', loading: false } })
+        else setState(function (s) { return { data: s.data, error: r && r.code ? ('注入失败：' + r.code) : '注入失败', loading: false } })
       }).catch(function (e) {
         setState(function (s) { return { data: s.data, error: String((e && e.message) || e), loading: false } })
+      }).finally(function () { setBusy(null) })
+    }
+    var uninjectMerge = function (m) {
+      if (busy) return
+      setBusy('uninject')
+      postJson('/sgx/merge/uninject', { sessionId: sessionId, mergeId: m.id }).then(function (r) {
+        if (r && r.ok) refresh()
+        else setState(function (s) { return { data: s.data, error: r && r.code ? ('停止注入失败：' + r.code) : '停止注入失败', loading: false } })
+      }).catch(function (e) {
+        setState(function (s) { return { data: s.data, error: String((e && e.message) || e), loading: false } })
+      }).finally(function () { setBusy(null) })
+    }
+    var toggleAutoSummary = function () {
+      if (busy) return
+      setBusy('settings')
+      postJson('/sgx/settings', { sessionId: sessionId, autoSummary: !(data.privacy && data.privacy.autoSummary) }).then(function (r) {
+        if (r && r.ok) refresh()
+        else setState(function (s) { return { data: s.data, error: r && r.code ? ('设置失败：' + r.code) : '设置失败', loading: false } })
+      }).finally(function () { setBusy(null) })
+    }
+    var purgePluginData = function () {
+      if (busy || !window.confirm('清除当前 workspace 的摘要、合入记录和插件设置？原始 DSH 会话不会删除。')) return
+      setBusy('purge')
+      postJson('/sgx/purge', { sessionId: sessionId, summaries: true, merges: true, settings: true }).then(function (r) {
+        if (r && r.ok) { setSelKey(null); refresh() }
+        else setState(function (s) { return { data: s.data, error: r && r.code ? ('清理失败：' + r.code) : '清理失败', loading: false } })
       }).finally(function () { setBusy(null) })
     }
 
@@ -587,6 +662,8 @@ function apply(ctx) {
         if (gTip && fc) sel = { kind: 'tip', branchTitle: gTip.title, branchId: gTip.id, commit: fc }
       } else if (selKey.indexOf('mg:') === 0) {
         for (var mi = 0; mi < L.mergeRows.length; mi++) if (L.mergeRows[mi].key === selKey) { sel = { kind: 'merge', merge: L.mergeRows[mi].merge }; break }
+      } else if (selKey.indexOf('rv:') === 0) {
+        for (var ri2 = 0; ri2 < L.revertRows.length; ri2++) if (L.revertRows[ri2].key === selKey) { sel = { kind: 'revert', merge: L.revertRows[ri2].merge, revert: L.revertRows[ri2].revert }; break }
       } else {
         var cSel = L.commitMap[selKey]
         if (cSel) sel = { kind: 'commit', commit: cSel }
@@ -594,7 +671,14 @@ function apply(ctx) {
     }
     var detail = null
     if (sel) {
-      if (sel.kind === 'merge') {
+      if (sel.kind === 'revert') {
+        detail = React.createElement('div', { className: 'sgx-detail' },
+          React.createElement('div', null,
+            React.createElement('span', { className: 'sgx-dk' }, 'Git revert'),
+            React.createElement('span', { className: 'sgx-dk' }, new Date(sel.revert.time || sel.revert.createdAt).toLocaleString())),
+          React.createElement('div', { className: 'sgx-dtitle' }, '已撤销：' + (sel.merge.title || sel.merge.id)),
+          React.createElement('div', { className: 'sgx-dsum' }, '合入祖先关系保留；对应动态上下文已停止生效，后续 merge 只共享来源分支的新增节点。'))
+      } else if (sel.kind === 'merge') {
         var m = sel.merge
         var io = m.io || {}
         var ioRows = []
@@ -606,7 +690,9 @@ function apply(ctx) {
           if (n >= 1 && n <= dt.length) return '#' + dt[n - 1]
           return dt[i] !== undefined ? '#' + dt[i] : ev
         }
-        ioRows.push(React.createElement('div', { key: 'entry', className: 'sgx-dsum' }, '被合入分支入口：并入 ' + (m.diffTurns || []).length + ' 个差分提交' + ((m.diffTurns || []).length ? ('（' + m.diffTurns.map(function (t) { return '#' + t }).join('、') + '）') : '') + '，共同祖先 #' + String(m.lcaKey || '').split(':')[1]))
+        var bases = m.mergeBaseKeys || (m.lcaKey ? [m.lcaKey] : [])
+        var baseText = bases.length ? bases.map(function (key) { return String(key).replace(/^[^:]+:/, '#') }).join('、') : '无'
+        ioRows.push(React.createElement('div', { key: 'entry', className: 'sgx-dsum' }, '被合入分支入口：并入 ' + (m.diffTurns || []).length + ' 个差分提交' + ((m.diffTurns || []).length ? ('（' + m.diffTurns.map(function (t) { return '#' + t }).join('、') + '）') : '') + '；最近公共祖先集：' + baseText))
         if (io.purpose) ioRows.push(React.createElement('div', { key: 'p', className: 'sgx-dsum' }, '目的：' + io.purpose))
         ;(io.propositions || []).forEach(function (p, pi) {
           ioRows.push(React.createElement('div', { key: 'pp' + pi, className: 'sgx-dsum' }, '• [' + ((p.ground && p.ground.kind) || 'inferred') + '] ' + p.claim + '（来源 ' + evTurnOf(p, pi) + ' · ' + truncate(m.sourceTitle, 14) + '）'))
@@ -625,8 +711,8 @@ function apply(ctx) {
           React.createElement('div', { className: 'sgx-dtitle' }, m.title || '合并'),
           ioRows,
           React.createElement('div', { className: 'sgx-drow' },
-            React.createElement('button', { className: 'sgx-btn', disabled: !!busy || m.injected, onClick: function () { injectMerge(m) } }, busy === 'inject' ? '注入中…' : (m.injected ? '已注入' : '注入到受体上下文')),
-            React.createElement('button', { className: 'sgx-btn', disabled: !!busy, onClick: function () { revertMerge(m) } }, busy === 'revert' ? '撤销中…' : '撤销合入')))
+            React.createElement('button', { className: 'sgx-btn', disabled: !!busy || m.status === 'reverted', onClick: function () { m.injected ? uninjectMerge(m) : injectMerge(m) } }, busy === 'inject' ? '注入中…' : (busy === 'uninject' ? '停止中…' : (m.injected ? '停止动态注入' : '动态注入到受体'))),
+            React.createElement('button', { className: 'sgx-btn', disabled: !!busy || m.status === 'reverted', onClick: function () { revertMerge(m) } }, busy === 'revert' ? '撤销中…' : (m.status === 'reverted' ? '已 Git revert' : 'Git revert'))))
       } else {
         var cm = sel.commit
         var ownerBranch = null
@@ -653,6 +739,9 @@ function apply(ctx) {
       React.createElement('div', { className: 'sgx-head' },
         React.createElement('span', { className: 'sgx-meta' }, data.workspace.title + ' · ' + data.branches.length + ' 分支 / ' + data.commits.length + ' 提交'),
         React.createElement('span', { className: 'sgx-grow' }),
+        React.createElement('span', { className: 'sgx-meta', title: (data.privacy && data.privacy.provider) ? ('AI: ' + data.privacy.provider + '/' + data.privacy.model) : '未配置默认模型' }, (data.privacy && data.privacy.autoSummary) ? '自动摘要：开' : '自动摘要：关'),
+        React.createElement('button', { className: 'sgx-btn', disabled: !!busy, onClick: toggleAutoSummary }, busy === 'settings' ? '保存…' : ((data.privacy && data.privacy.autoSummary) ? '关闭' : '启用')),
+        React.createElement('button', { className: 'sgx-btn', disabled: !!busy, onClick: purgePluginData }, busy === 'purge' ? '清理…' : '清除数据'),
         React.createElement('button', { className: 'sgx-btn', disabled: !!busy, onClick: function () { refresh() } }, state.loading ? '刷新…' : '刷新')),
       trees.length > 1 && React.createElement('div', { className: 'sgx-tabsBar' }, trees.map(function (t, ti) {
         return React.createElement('button', { key: t.rootId, className: 'sgx-tree' + (t.rootId === activeTree ? ' sgx-cur' : ''), onClick: function () { setTreeSel(t.rootId) }, title: t.rootTitle + ' · ' + t.branches.length + ' 分支' },
@@ -670,11 +759,13 @@ function apply(ctx) {
             }
             return React.createElement('path', { key: 'mp' + i, d: mp.d, fill: 'none', stroke: mp.color, strokeWidth: mp.dashed ? 1.5 : 2, strokeDasharray: mp.dashed ? '3 3' : undefined, opacity: 0.9 })
           }),
+          revertPaths.map(function (rp, i) { return React.createElement('path', { key: 'rp' + i, d: rp.d, fill: 'none', stroke: 'var(--dsw-alias-state-error-primary)', strokeWidth: 1.5, opacity: 0.85 }) }),
           tipGroups,
           mergeGroups,
+          revertGroups,
           commitGroups)),
       detail,
-      React.createElement('div', { className: 'sgx-note' }, '点击节点显示详情（checkout 进入该节点会话位置）；分叉与原分支共享分叉前最后一个提交，最新提交在顶部；方形节点=合入（可撤销/注入），虚线箭头=合入方向，圆环=当前会话所处提交。注入的合入消息是可追溯的结论入口，模型可用 session_graph_view / session_graph_read 溯源原文。'))
+      React.createElement('div', { className: 'sgx-note' }, '点击节点显示详情（checkout 进入该节点会话位置）；分叉与原分支共享分叉前最后一个提交，最新提交在顶部；方形节点=合入，菱形节点=Git revert，虚线箭头=合入方向，圆环=当前会话所处提交。动态注入不改写聊天历史，模型可用 session_graph_view / session_graph_read 溯源原文。'))
   }
 
   // ------------------------------------------------------------------
@@ -764,3 +855,4 @@ function apply(ctx) {
 
 exports.inject = inject
 exports.apply = apply
+exports.__test = { groupTrees: groupTrees, layoutTree: layoutTree }
