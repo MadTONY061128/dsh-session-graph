@@ -106,7 +106,11 @@ function layoutTree(data, treeId) {
     return d
   }
   var ordered = branchIds.map(function (id) { return byId[id] }).sort(function (a, b) {
-    return depthOf(a.id) - depthOf(b.id) || (a.createdAt - b.createdAt) || 0
+    // 自适应 lane：有提交的分支靠左（贴近主干），空分支 tip 靠右，
+    // 避免空 lane 夹在中间造成"未连接"的观感。
+    var ea = (a.commitCount || 0) > 0 ? 0 : 1
+    var eb = (b.commitCount || 0) > 0 ? 0 : 1
+    return (ea - eb) || (depthOf(a.id) - depthOf(b.id)) || (a.createdAt - b.createdAt) || 0
   })
   var laneOf = {}
   ordered.forEach(function (b, i) { laneOf[b.id] = i })
@@ -178,6 +182,29 @@ function layoutTree(data, treeId) {
   ordered.forEach(function (b) { if (b.parentId !== null) place(b.id) })
 
   var rowOf = rowIndex
+
+  // merge cells: place each active merge directly ABOVE its target B's head.
+  var merges = (data && data.merges) || []
+  var mergeRows = []
+  merges.slice().sort(function (a, b) { return (a.time || 0) - (b.time || 0) }).forEach(function (m) {
+    if (laneOf[m.targetB] === undefined) return
+    var at = rowOf[m.headBeforeB] !== undefined ? rowOf[m.headBeforeB] : rows.length
+    rows.splice(at, 0, { kind: 'merge', key: m.key, merge: m })
+    bumpAfter(at)
+    mergeRows.push({ key: m.key, merge: m })
+  })
+  mergeRows.forEach(function (mr) {
+    for (var r2 = 0; r2 < rows.length; r2++) {
+      if (rows[r2].kind === 'merge' && rows[r2].key === mr.key) { mr.row = r2; break }
+    }
+    mr.targetLane = laneOf[mr.merge.targetB]
+    mr.sourceLane = laneOf[mr.merge.sourceA] !== undefined ? laneOf[mr.merge.sourceA] : mr.targetLane
+    mr.sourceRow = mr.merge.sourceHeadKey !== undefined && rowOf[mr.merge.sourceHeadKey] !== undefined ? rowOf[mr.merge.sourceHeadKey] : -1
+    mr.headBeforeRow = mr.merge.headBeforeB !== undefined && rowOf[mr.merge.headBeforeB] !== undefined ? rowOf[mr.merge.headBeforeB] : -1
+  })
+
+  // geom 必须在 merge 单元格插入之后计算：merge 行会 bump 后续所有行号，
+  // 若先算 geom（forkRow/headRow/tipRow），lane 线与节点就会整体错位。
   var geom = []
   ordered.forEach(function (b) {
     var info = branchInfo[b.id]
@@ -208,25 +235,6 @@ function layoutTree(data, treeId) {
       headRow: headRow,
       tipRow: tipRow,
     })
-  })
-  // merge cells: place each active merge directly ABOVE its target B's head.
-  var merges = (data && data.merges) || []
-  var mergeRows = []
-  merges.slice().sort(function (a, b) { return (a.time || 0) - (b.time || 0) }).forEach(function (m) {
-    if (laneOf[m.targetB] === undefined) return
-    var at = rowOf[m.headBeforeB] !== undefined ? rowOf[m.headBeforeB] : rows.length
-    rows.splice(at, 0, { kind: 'merge', key: m.key, merge: m })
-    bumpAfter(at)
-    mergeRows.push({ key: m.key, merge: m })
-  })
-  mergeRows.forEach(function (mr) {
-    for (var r2 = 0; r2 < rows.length; r2++) {
-      if (rows[r2].kind === 'merge' && rows[r2].key === mr.key) { mr.row = r2; break }
-    }
-    mr.targetLane = laneOf[mr.merge.targetB]
-    mr.sourceLane = laneOf[mr.merge.sourceA] !== undefined ? laneOf[mr.merge.sourceA] : mr.targetLane
-    mr.sourceRow = mr.merge.sourceHeadKey !== undefined && rowOf[mr.merge.sourceHeadKey] !== undefined ? rowOf[mr.merge.sourceHeadKey] : -1
-    mr.headBeforeRow = mr.merge.headBeforeB !== undefined && rowOf[mr.merge.headBeforeB] !== undefined ? rowOf[mr.merge.headBeforeB] : -1
   })
 
   return {
@@ -333,11 +341,13 @@ function apply(ctx) {
 
     React.useEffect(function () {
       var alive = true
-      if (visible) refresh()
+      // 卡片可见性不阻塞数据加载：面板收起时也在后台刷新，
+      // 避免打开面板后长期停在「加载中…」。
+      refresh()
       if (!timerCtx) return
-      var stop = timerCtx.interval(function () { if (alive && visible) refresh() }, 30000)
+      var stop = timerCtx.interval(function () { if (alive) refresh() }, 30000)
       return function () { alive = false; stop() }
-    }, [refresh, visible, timerCtx])
+    }, [refresh, timerCtx])
 
     // follow the current session's tree when the session changes
     React.useEffect(function () { setTreeSel(null) }, [sessionId])
@@ -356,6 +366,24 @@ function apply(ctx) {
     var L = activeTree ? layoutTree(data, activeTree) : null
     var lanes = L ? L.lanes : 0
     var rowCount = L ? L.rowCount : 0
+
+    // 当前会话所处提交 = 自身分支最新的 native commit（空分支则为 tip）
+    var curInfo = null
+    if (data && data.branches && L) {
+      for (var cbi0 = 0; cbi0 < data.branches.length; cbi0++) {
+        var cb0 = data.branches[cbi0]
+        if (cb0.id !== sessionId) continue
+        var own0 = (cb0.chain || []).slice(Math.max(0, (cb0.chain || []).length - (cb0.commitCount || 0)))
+        var hk0 = null
+        var ht0 = -1
+        for (var ki0 = 0; ki0 < own0.length; ki0++) {
+          var c20 = L.commitMap[own0[ki0]]
+          if (c20 && (c20.time || 0) > ht0) { ht0 = c20.time; hk0 = own0[ki0] }
+        }
+        curInfo = { headKey: hk0, empty: (cb0.commitCount || 0) === 0, branchId: cb0.id }
+        break
+      }
+    }
     var width = PAD_X * 2 + lanes * LANE_W + CONTENT_W
     var laneEndX = PAD_X + lanes * LANE_W
     var height = TOP_PAD + LABEL_H + rowCount * ROW_H + PAD_X + 6
@@ -462,7 +490,11 @@ function apply(ctx) {
       if (mr.sourceRow >= 0) {
         var sx = laneX(mr.sourceLane)
         var sy = rowY(mr.sourceRow)
-        mergePaths.push({ d: 'M ' + sx + ' ' + sy + ' C ' + sx + ' ' + my + ', ' + bx + ' ' + sy + ', ' + bx + ' ' + my, color: sColor, dashed: true })
+        var dir1 = sy < my ? 1 : -1
+        var mEndY = dir1 > 0 ? my - 5.5 : my + 5.5
+        mergePaths.push({ d: 'M ' + sx + ' ' + sy + ' C ' + sx + ' ' + mEndY + ', ' + bx + ' ' + sy + ', ' + bx + ' ' + mEndY, color: sColor, dashed: true })
+        // 方向箭头：源分支 S 曲线末端汇入 merge 方块（源色实心三角，朝向随源位置自适应）
+        mergePaths.push({ kind: 'arrow', x: bx, y: my, dir: dir1, color: sColor })
       }
       mergeGroups.push(React.createElement('g', { key: mr.key, className: 'sgx-mg', style: { cursor: 'pointer' }, onClick: function () { setSelKey(mr.key) } },
         React.createElement('circle', { cx: bx, cy: my, r: 9, fill: 'transparent' }),
@@ -482,11 +514,14 @@ function apply(ctx) {
         var dx = laneX(ownerLane)
         var dcolor = laneColor(ownerLane)
         var selected = selKey === k
+        var isCur = curInfo && curInfo.headKey === k
         commitGroups.push(React.createElement('g', { key: k, className: 'sgx-cg', style: { cursor: 'pointer' }, onClick: function () { setSelKey(k) } },
           React.createElement('circle', { cx: dx, cy: y, r: 8, fill: 'transparent' }),
+          isCur && React.createElement('rect', { x: laneEndX + 4, y: y - 10, width: CONTENT_W - 8, height: 20, rx: 5, fill: 'rgba(86,129,210,0.18)' }),
           selected && React.createElement('circle', { cx: dx, cy: y, r: 8, fill: 'none', stroke: 'var(--dsw-alias-brand-primary)', strokeWidth: 2 }),
+          isCur && React.createElement('circle', { cx: dx, cy: y, r: 8, fill: 'none', stroke: dcolor, strokeWidth: 2 }),
           React.createElement('circle', { cx: dx, cy: y, r: 4.5, fill: dcolor, stroke: 'var(--dsw-alias-bg-overlay)', strokeWidth: 1 }),
-          React.createElement('text', { x: laneEndX + 10, y: y + 4, fontSize: 11.5, fill: 'var(--dsw-alias-label-secondary)', style: { cursor: 'pointer' } }, truncate(c.title, 30))))
+          React.createElement('text', { x: laneEndX + 10, y: y + 4, fontSize: 11.5, fill: isCur ? 'var(--dsw-alias-label-primary)' : 'var(--dsw-alias-label-secondary)', style: { cursor: 'pointer' } }, truncate(c.title, 30))))
       } else {
         var g = null
         for (var ti = 0; ti < L.geom.length; ti++) if (L.geom[ti].id === cell.branchId) { g = L.geom[ti]; break }
@@ -496,12 +531,14 @@ function apply(ctx) {
         var tipKey2 = '__tip__' + g.id
         var forkCommit = g.forkKey ? L.commitMap[g.forkKey] : null
         var sel2 = selKey === tipKey2
+        var isCurTip = curInfo && curInfo.empty && g.id === curInfo.branchId
         tipGroups.push(React.createElement('g', { key: tipKey2, className: 'sgx-tip', style: { cursor: 'pointer' }, onClick: function () { setSelKey(tipKey2) } },
           React.createElement('circle', { cx: lx2, cy: y, r: 8, fill: 'transparent' }),
-          React.createElement('circle', { cx: lx2, cy: y, r: 5, fill: 'none', stroke: color2, strokeWidth: 2 }),
+          isCurTip && React.createElement('rect', { x: laneEndX + 4, y: y - 10, width: CONTENT_W - 8, height: 20, rx: 5, fill: 'rgba(86,129,210,0.18)' }),
+          React.createElement('circle', { cx: lx2, cy: y, r: 5, fill: 'none', stroke: color2, strokeWidth: isCurTip ? 2.5 : 2 }),
           sel2 && React.createElement('circle', { cx: lx2, cy: y, r: 8, fill: 'none', stroke: 'var(--dsw-alias-brand-primary)', strokeWidth: 2 }),
           React.createElement('circle', { cx: lx2, cy: y, r: 1.8, fill: color2 }),
-          forkCommit && React.createElement('text', { x: laneEndX + 10, y: y + 4, fontSize: 11.5, fill: 'var(--dsw-alias-label-secondary)', style: { cursor: 'pointer' } }, '新分支 · ' + truncate(g.title, 24))))
+          forkCommit && React.createElement('text', { x: laneEndX + 10, y: y + 4, fontSize: 11.5, fill: isCurTip ? 'var(--dsw-alias-label-primary)' : 'var(--dsw-alias-label-secondary)', style: { cursor: 'pointer' } }, '新分支 · ' + truncate(g.title, 24))))
       }
     })
 
@@ -630,12 +667,19 @@ function apply(ctx) {
       React.createElement('div', { className: 'sgx-net' },
         React.createElement('svg', { width: width, height: height, viewBox: '0 0 ' + width + ' ' + height },
           lanePaths.map(function (lp, i) { return React.createElement('path', { key: 'lp' + i, d: lp.d, fill: 'none', stroke: lp.color, strokeWidth: 2, opacity: 0.9 }) }),
-          mergePaths.map(function (mp, i) { return React.createElement('path', { key: 'mp' + i, d: mp.d, fill: 'none', stroke: mp.color, strokeWidth: mp.dashed ? 1.5 : 2, strokeDasharray: mp.dashed ? '3 3' : undefined, opacity: 0.9 }) }),
+          mergePaths.map(function (mp, i) {
+            if (mp.kind === 'arrow') {
+              var a1 = mp.dir > 0 ? mp.y - 12 : mp.y + 12
+              var a2 = mp.dir > 0 ? mp.y - 4.2 : mp.y + 4.2
+              return React.createElement('polygon', { key: 'mp' + i, points: (mp.x - 3.4) + ',' + a1 + ' ' + (mp.x + 3.4) + ',' + a1 + ' ' + mp.x + ',' + a2, fill: mp.color, opacity: 0.95 })
+            }
+            return React.createElement('path', { key: 'mp' + i, d: mp.d, fill: 'none', stroke: mp.color, strokeWidth: mp.dashed ? 1.5 : 2, strokeDasharray: mp.dashed ? '3 3' : undefined, opacity: 0.9 })
+          }),
           tipGroups,
           mergeGroups,
           commitGroups)),
       detail,
-      React.createElement('div', { className: 'sgx-note' }, '点击节点显示详情（checkout 进入该节点会话位置）；分叉与原分支共享分叉前最后一个提交，最新提交在顶部；方形节点=合入（可撤销/注入）。注入的合入消息是可追溯的结论入口，模型可用 session_graph_view / session_graph_read 溯源原文。'))
+      React.createElement('div', { className: 'sgx-note' }, '点击节点显示详情（checkout 进入该节点会话位置）；分叉与原分支共享分叉前最后一个提交，最新提交在顶部；方形节点=合入（可撤销/注入），虚线箭头=合入方向，圆环=当前会话所处提交。注入的合入消息是可追溯的结论入口，模型可用 session_graph_view / session_graph_read 溯源原文。'))
   }
 
   // ------------------------------------------------------------------
