@@ -39,8 +39,8 @@
   ],
   "scripts": {
     "build": "node build.mjs",
-    "test": "node --test --test-isolation=none",
-    "check": "node --check host/index.js && node --check host/dag-core.js && node --check client-src.js && node --test --test-isolation=none && node build.mjs"
+    "test": "node test/run.js",
+    "check": "node --check host/index.js && node --check host/dag-core.js && node --check client-src.js && node test/run.js && node build.mjs"
   },
   "license": "MIT"
 }
