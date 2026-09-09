@@ -1131,6 +1131,16 @@ export function apply(ctx) {
           await deleteStored(mergeTable, m.id)
           removed.merges++
         }
+        // Degenerate merges (fewer than two parents) are excluded from the
+        // project view but still occupy storage and idempotency keys; purge
+        // them here so re-integrating a source creates a clean merge.
+        for (const m of [...merges.values()]) {
+          if (!m || m.workspaceKey !== p.workspaceKey) continue
+          if (Array.isArray(m.parentKeys) && m.parentKeys.filter(Boolean).length === 2) continue
+          merges.delete(m.id)
+          await deleteStored(mergeTable, m.id)
+          removed.merges++
+        }
         for (const [id, prepared] of [...preparations.entries()]) {
           if (!prepared || prepared.workspaceKey !== p.workspaceKey) continue
           preparations.delete(id)
