@@ -1142,7 +1142,7 @@ export function apply(ctx) {
           removed.merges++
         }
         for (const [id, prepared] of [...preparations.entries()]) {
-          if (!prepared || prepared.workspaceKey !== p.workspaceKey) continue
+          if (!prepared || (prepared.workspaceKey && prepared.workspaceKey !== p.workspaceKey)) continue
           preparations.delete(id)
           if (prepared.idempotencyKey) preparationKeys.delete(prepared.idempotencyKey)
           await deleteStored(preparedTable, id)
