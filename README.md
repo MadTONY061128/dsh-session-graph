@@ -9,7 +9,7 @@ Git-graph 风格的项目会话信息 DAG 插件（DSH web profile bundle）。
 - **merge = 双亲 DAG 节点**：把来源 head 尚未到达受体 head 的完整可达集差萃取为 information-object；
 - **revert = 单亲抵消节点**：保留 merge 祖先关系和审计，只停止对应信息对模型上下文生效。
 
-## v0.6 核心语义
+## v0.7 核心语义
 
 会话 fork 树和信息 DAG 是两个不同结构。设来源、受体有效 head 分别为 $h_A,h_B$，祖先闭包为
 $Anc(h)$，则一次合入的权威增量是：
@@ -35,6 +35,12 @@ Git revert 创建新节点而不删除 merge：历史可达性保持，动态注
 6. 每个分支同时暴露 `nativeHeadKey` 与 `effectiveHeadKey`；后者包含 merge/revert DAG 节点。
 7. 图谱后台刷新默认 120 秒；页面隐藏时暂停，重新可见、切换会话和手动操作时立即刷新。
 8. 所有持久化记录带 `workspaceKey`；读取、合入、注入、撤销和清理均执行 workspace 围栏校验。
+9. 可信宿主插件可注册唯一 `sessionGraph` coordinator，以显式逻辑成员覆盖物理 workspace 成员、
+   guard managed merge/revert，并通过 durable prepare/commit/abort 和 expected-head fencing 组成更大的事务。
+
+coordinator 获得的是不可由模型工具或 HTTP 参数伪造的闭包能力。未注册 coordinator 时，原有 workspace
+图谱、`/sgx/*` 路由和三个 `session_graph_*` 工具保持 v0.6 行为；注册后，普通调用仍走 guard，只有
+coordinator handle 能提交 prepared merge。
 
 ## 隐私
 

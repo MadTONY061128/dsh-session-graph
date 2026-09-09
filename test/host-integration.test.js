@@ -17,6 +17,7 @@ function createHarness() {
     ['R', turn(0, 0, 100, 'root', 'root done')],
     ['A', turn(1, 10, 200, 'A one', 'A one done')],
     ['B', turn(1, 10, 210, 'B one', 'B one done')],
+    ['W', turn(1, 10, 220, 'worker one', 'worker done')],
     ['R2', turn(0, 0, 100, 'root2', 'root2 done')],
     ['X', turn(1, 10, 200, 'X one', 'X one done')],
   ])
@@ -24,12 +25,15 @@ function createHarness() {
     { id: 'R', cwd: '/w/one', parentSession: null, seedLength: 0, createdAt: 1 },
     { id: 'A', cwd: '/w/one', parentSession: 'R', seedLength: 4, createdAt: 2 },
     { id: 'B', cwd: '/w/one', parentSession: 'R', seedLength: 4, createdAt: 3 },
+    { id: 'Z', cwd: '/w/one', parentSession: 'R', seedLength: 0, createdAt: 5 },
+    { id: 'W', cwd: '/w/worker', parentSession: 'R', seedLength: 4, createdAt: 4 },
     { id: 'R2', cwd: '/w/two', parentSession: null, seedLength: 0, createdAt: 1 },
     { id: 'X', cwd: '/w/two', parentSession: 'R2', seedLength: 4, createdAt: 2 },
   ]
   const workspaces = [
     { id: 'w1', path: '/w/one', title: 'one', sessionIds: ['R', 'A', 'B'] },
     { id: 'w2', path: '/w/two', title: 'two', sessionIds: ['R2', 'X'] },
+    { id: 'w3', path: '/w/worker', title: 'worker', sessionIds: ['W'] },
   ]
   const stores = new Map()
   const tableFor = (name) => {
@@ -38,6 +42,7 @@ function createHarness() {
     return { entries: () => data.entries(), put: async (key, value) => data.set(key, structuredClone(value)), delete: async (key) => data.delete(key) }
   }
   const handlers = new Map()
+  const services = new Map()
   let routeHandler = null
   const ctx = {
     sessionQuery: {
@@ -64,6 +69,7 @@ function createHarness() {
     agentDefaultModel: { currentSelection: () => ({ provider: 'mock', model: 'mock-1' }) },
     webServer: { register: (spec) => { routeHandler = spec.handler; return () => {} } },
     effect: (factory) => factory(),
+    provide: (name, value) => { services.set(name, value); return () => services.delete(name) },
     on: (name, fn) => { handlers.set(name, fn); return () => {} },
   }
   apply(ctx)
@@ -82,7 +88,7 @@ function createHarness() {
       routeHandler(req, res)
     })
   }
-  return { request, sessionEvents, handlers, stores }
+  return { request, sessionEvents, handlers, stores, services }
 }
 
 test('host enforces DAG merge, dynamic injection, Git revert, privacy and workspace isolation', async () => {
@@ -155,4 +161,45 @@ test('concurrent merge requests serialize and reuse one result', async () => {
   assert.equal(right.body.ok, true)
   assert.equal(left.body.merge.id, right.body.merge.id)
   assert.equal([...h.stores.get('merges').values()].length, 1)
+})
+
+test('trusted coordinator spans worktrees, guards managed mutations and commits prepared merges', async () => {
+  const h = createHarness()
+  const service = h.services.get('sessionGraph')
+  assert.equal(service.version, 1)
+  const coordinator = service.registerCoordinator({
+    resolveMembership: ({ sessionId }) => ['R', 'A', 'B', 'W'].includes(sessionId)
+      ? { graphId: 'wf-1', label: 'workflow one', sessionIds: ['R', 'A', 'B', 'W'] }
+      : null,
+    guardMutation: ({ target }) => target === 'B' ? { allow: false, code: 'manager-approval-required' } : { allow: true },
+  })
+
+  const denied = (await h.request('POST', '/sgx/merge', { sessionId: 'B', sourceA: 'W', targetB: 'B' })).body
+  assert.deepEqual(denied, { ok: false, code: 'manager-approval-required' })
+
+  const graph = await coordinator.graph('B')
+  assert.equal(graph.workspace.key, 'graph:wf-1')
+  assert.deepEqual(graph.branches.map((b) => b.id).sort(), ['A', 'B', 'R', 'W'])
+
+  const prepared = await coordinator.prepareMerge({
+    callerSessionId: 'B', source: 'W', target: 'B',
+    expectedSourceHead: 'W:1', expectedTargetHead: 'B:1', idempotencyKey: 'tx-1',
+  })
+  assert.equal(prepared.ok, true)
+  assert.equal(prepared.preparation.state, 'prepared')
+  assert.deepEqual(prepared.preparation.merge.deltaKeys, ['W:1'])
+
+  const committed = await coordinator.commitMerge({ preparationId: prepared.preparation.id })
+  assert.equal(committed.ok, true)
+  const repeated = await coordinator.commitMerge({ preparationId: prepared.preparation.id })
+  assert.equal(repeated.ok, true)
+  assert.equal(repeated.dedup, true)
+  coordinator.release()
+})
+
+test('merging into a target branch with no completed turn is rejected', async () => {
+  const h = createHarness()
+  const denied = (await h.request('POST', '/sgx/merge', { sessionId: 'Z', sourceA: 'A', targetB: 'Z' })).body
+  assert.equal(denied.ok, false)
+  assert.equal(denied.code, 'target-head-empty')
 })

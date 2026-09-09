@@ -1,6 +1,6 @@
 {
   "name": "dsh-session-graph",
-  "version": "0.6.0",
+  "version": "0.7.0",
   "description": "Git-graph 风格的项目对话分叉图：branch=会话，commit=一轮用户请求+AI 完成（AI 总结要点）。DSH web profile bundle。",
   "type": "module",
   "engines": {

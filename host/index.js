@@ -45,18 +45,29 @@ export function apply(ctx) {
   let table = null
   let mergeTable = null
   let settingsTable = null
+  let preparedTable = null
   const summaries = new Map()
   const merges = new Map()
   const settings = new Map()
+  const preparations = new Map()
+  const preparationKeys = new Map()
   const projectCache = new Map()
+  let coordinator = null
+  const coordinatorCapability = Object.freeze({ kind: 'dsh-session-graph-coordinator' })
   const domainReady = (async () => {
-    domain = await D.open({ name: 'session_graph', version: 0, tables: { commits: { valueSchema: DUCK }, merges: { valueSchema: DUCK }, settings: { valueSchema: DUCK } } })
+    domain = await D.open({ name: 'session_graph', version: 0, tables: { commits: { valueSchema: DUCK }, merges: { valueSchema: DUCK }, settings: { valueSchema: DUCK }, prepared: { valueSchema: DUCK } } })
     table = domain.table('commits')
     mergeTable = domain.table('merges')
     settingsTable = domain.table('settings')
+    preparedTable = domain.table('prepared')
     for (const [k, v] of table.entries()) summaries.set(k, v)
     for (const [k, v] of mergeTable.entries()) merges.set(k, v)
     for (const [k, v] of settingsTable.entries()) settings.set(k, v)
+    for (const [k, v] of preparedTable.entries()) {
+      if (!v || v.state !== 'prepared' || Number(v.expiresAt) <= Date.now()) continue
+      preparations.set(k, v)
+      if (v.idempotencyKey) preparationKeys.set(v.idempotencyKey, k)
+    }
   })().catch((e) => { console.error('[git-graph] storage unavailable', e) })
   ctx.effect(() => {
     return () => {
@@ -65,6 +76,7 @@ export function apply(ctx) {
       table = null
       mergeTable = null
       settingsTable = null
+      preparedTable = null
       if (d) d.close().catch(() => {})
     }
   })
@@ -96,6 +108,7 @@ export function apply(ctx) {
     return String(value || '').replace(/\\/g, '/').replace(/\/$/, '').toLowerCase()
   }
   function workspaceKeyOf(p) {
+    if (p && p.graphId) return 'graph:' + p.graphId
     if (p && p.ws && p.ws.id) return 'ws:' + p.ws.id
     return 'cwd:' + normalizePath(p && p.cwd)
   }
@@ -455,6 +468,10 @@ export function apply(ctx) {
 
   // ---------- project corpus (shared by graph & merge) ----------
   function invalidateProject(sessionId) {
+    if (!sessionId) {
+      projectCache.clear()
+      return
+    }
     const cached = projectCache.get(sessionId)
     if (!cached) return
     for (const id of cached.members || []) projectCache.delete(id)
@@ -482,6 +499,56 @@ export function apply(ctx) {
       }
     }
     if (!memberSet.has(targetId)) { memberSet.add(targetId); members.push(targetId) }
+    // Subagent descendant closure: native subagent sessions are not listed in
+    // ws.sessionIds, but they share the workspace cwd and carry a parentSession
+    // lineage. Include same-workspace subagent descendants so the information
+    // DAG covers the whole delegation tree of this workspace.
+    if (ws) {
+      const wsPath = normalizePath(ws.path)
+      const childrenByParent = new Map()
+      for (const r of records) {
+        const h = r && r.header
+        if (!h || h.origin !== 'subagent') continue
+        if (normalizePath(h.cwd) !== wsPath) continue
+        if (typeof h.parentSession !== 'string' || !h.parentSession) continue
+        const arr = childrenByParent.get(h.parentSession)
+        if (arr) arr.push(h.id)
+        else childrenByParent.set(h.parentSession, [h.id])
+      }
+      const queue = [...members]
+      const visited = new Set(members)
+      while (queue.length) {
+        const cur = queue.pop()
+        const children = childrenByParent.get(cur) || []
+        for (const childId of children) {
+          if (visited.has(childId)) continue
+          visited.add(childId)
+          memberSet.add(childId)
+          members.push(childId)
+          queue.push(childId)
+        }
+      }
+    }
+    let graphId = null
+    let graphLabel = null
+    if (coordinator && typeof coordinator.resolveMembership === 'function') {
+      try {
+        const resolved = await coordinator.resolveMembership({ sessionId: targetId, header: main.header, workspace: ws })
+        if (resolved && typeof resolved.graphId === 'string' && resolved.graphId) {
+          graphId = resolved.graphId
+          graphLabel = typeof resolved.label === 'string' ? resolved.label : null
+          // A logical workflow graph is an explicit membership boundary, not
+          // the union with every unrelated session registered in one physical
+          // worktree workspace.
+          members.length = 0
+          memberSet.clear()
+          for (const id of Array.isArray(resolved.sessionIds) ? resolved.sessionIds : []) {
+            if (typeof id === 'string' && byId.has(id) && !memberSet.has(id)) { memberSet.add(id); members.push(id) }
+          }
+          if (!memberSet.has(targetId)) { memberSet.add(targetId); members.push(targetId) }
+        }
+      } catch (e) { console.error('[git-graph] coordinator membership failed', e) }
+    }
     const safeMembers = members.filter((id) => byId.has(id))
 
     const titleResults = await Q.readTitleSnapshots(safeMembers)
@@ -569,7 +636,7 @@ export function apply(ctx) {
       branchById.set(id, branch)
     }
 
-    const p = { byId, ws, cwd, safeMembers, memberSet, titles, seedLengths, native, commitByKey, branches, branchById }
+    const p = { byId, ws, cwd, graphId, graphLabel, safeMembers, memberSet, titles, seedLengths, native, commitByKey, branches, branchById }
     p.workspaceKey = workspaceKeyOf(p)
     p.projectMerges = []
     for (const m of merges.values()) {
@@ -600,6 +667,13 @@ export function apply(ctx) {
         changed = true
       }
       if (changed && mergeTable) mergeTable.put(m.id, m).catch((e) => console.error('[git-graph] merge migration persist failed', e))
+      // Degenerate merges (fewer than two parents — e.g. created before the
+      // target branch had any completed turn) would fail the whole graph;
+      // skip them with a diagnostic instead of aborting the project build.
+      if (!Array.isArray(m.parentKeys) || m.parentKeys.filter(Boolean).length !== 2) {
+        console.error('[git-graph] skipping degenerate merge ' + (m.key || m.id) + ' (parentKeys=' + JSON.stringify(m.parentKeys) + ')')
+        continue
+      }
       p.projectMerges.push(m)
     }
     p.dag = buildInformationDag({ branches, commitByKey, merges: p.projectMerges })
@@ -652,10 +726,10 @@ export function apply(ctx) {
   }
   function projectLabel(p) {
     return {
-      id: p.ws ? p.ws.id : '',
+      id: p.graphId || (p.ws ? p.ws.id : ''),
       key: p.workspaceKey || workspaceKeyOf(p),
       path: p.ws ? p.ws.path : (p.cwd || ''),
-      title: p.ws ? p.ws.title : (p.cwd ? (p.cwd.split('/').filter(Boolean).pop() || p.cwd) : '未命名项目'),
+      title: p.graphLabel || (p.ws ? p.ws.title : (p.cwd ? (p.cwd.split('/').filter(Boolean).pop() || p.cwd) : '未命名项目')),
     }
   }
 
@@ -718,13 +792,51 @@ export function apply(ctx) {
     return out
   }
 
-  async function mergeFor(callerSessionId, source, target) {
+  async function mutationDenied(operation, callerSessionId, source, target, mergeId, capability) {
+    if (capability === coordinatorCapability || !coordinator || typeof coordinator.guardMutation !== 'function') return null
+    try {
+      const decision = await coordinator.guardMutation({ operation, callerSessionId, source, target, mergeId })
+      if (decision === false) return 'managed-by-workflow'
+      if (decision && decision.allow === false) return decision.code || 'managed-by-workflow'
+      return null
+    } catch (e) {
+      console.error('[git-graph] coordinator guard failed', e)
+      return 'coordinator-unavailable'
+    }
+  }
+
+  async function persistPreparation(prepared) {
+    preparations.set(prepared.id, prepared)
+    if (prepared.idempotencyKey) preparationKeys.set(prepared.idempotencyKey, prepared.id)
+    if (preparedTable) await preparedTable.put(prepared.id, prepared)
+  }
+
+  async function prepareMergeFor(args, capability) {
+    await domainReady
+    const callerSessionId = args && args.callerSessionId
+    const source = args && args.source
+    const target = args && args.target
+    const idempotencyKey = args && args.idempotencyKey
     if (typeof callerSessionId !== 'string' || typeof source !== 'string' || typeof target !== 'string' || !source || !target) return { ok: false, code: 'bad-args' }
+    const denied = await mutationDenied('merge', callerSessionId, source, target, null, capability)
+    if (denied) return { ok: false, code: denied }
+    if (typeof idempotencyKey === 'string' && preparationKeys.has(idempotencyKey)) {
+      const prior = preparations.get(preparationKeys.get(idempotencyKey))
+      if (prior) return { ok: true, preparation: prior, dedup: true }
+    }
     const initial = await loadProject(callerSessionId)
     if (initial.error) return { ok: false, code: initial.error }
     if (!initial.branchById.has(source) || !initial.branchById.has(target)) return { ok: false, code: 'workspace-mismatch' }
     const lockKey = initial.workspaceKey + '|' + source + '|' + target
     return await withMergeLock(lockKey, async () => {
+      if (typeof idempotencyKey === 'string' && preparationKeys.has(idempotencyKey)) {
+        const prior = preparations.get(preparationKeys.get(idempotencyKey))
+        if (prior) {
+          if (prior.state === 'committed') return { ok: true, merge: prior.committedMerge, dedup: true, alreadyCommitted: true }
+          return { ok: true, preparation: prior, dedup: true }
+        }
+      }
+      invalidateProject(callerSessionId)
       const p = await loadProject(callerSessionId)
       if (p.error) return { ok: false, code: p.error }
       if (source === target) return { ok: false, code: 'self' }
@@ -732,36 +844,35 @@ export function apply(ctx) {
       const B = p.branchById.get(target)
       if (!A || !B) return { ok: false, code: 'workspace-mismatch' }
       if (rootBranchId(A, p.branchById) !== rootBranchId(B, p.branchById)) return { ok: false, code: 'unrelated' }
-      const sourceHead = p.dag.branchHeads.get(source)
-      const targetHead = p.dag.branchHeads.get(target)
+      const sourceHead = p.dag.branchHeads.get(source) || null
+      const targetHead = p.dag.branchHeads.get(target) || null
+      if (args.expectedSourceHead !== undefined && args.expectedSourceHead !== sourceHead) return { ok: false, code: 'source-head-moved', actual: sourceHead }
+      if (args.expectedTargetHead !== undefined && args.expectedTargetHead !== targetHead) return { ok: false, code: 'target-head-moved', actual: targetHead }
       if (!sourceHead) return { ok: false, code: 'no-effective-increment' }
+      if (!targetHead) return { ok: false, code: 'target-head-empty' }
       const deltaKeys = p.dag.delta(sourceHead, targetHead)
       if (deltaKeys.length === 0) {
-        // A concurrent or repeated request may observe the merge node produced
-        // by the first request as its new target head. Reuse that result rather
-        // than creating an empty merge or reporting a misleading failure.
-        const absorbed = [...(p.projectMerges || [])].reverse().find((m) =>
-          m.sourceA === source && m.targetB === target && m.sourceHeadKey === sourceHead)
-        if (absorbed) return { ok: true, merge: serializeMerge(absorbed, p.branchById), dedup: true }
+        const absorbed = [...(p.projectMerges || [])].reverse().find((m) => m.sourceA === source && m.targetB === target && m.sourceHeadKey === sourceHead)
+        if (absorbed) return { ok: true, merge: serializeMerge(absorbed, p.branchById), dedup: true, alreadyCommitted: true }
         return { ok: false, code: 'already-contained' }
       }
       const existing = (p.projectMerges || []).find((m) => m.sourceA === source && m.targetB === target && m.sourceHeadKey === sourceHead && (m.targetParentKey || m.headBeforeB) === targetHead)
-      if (existing) return { ok: true, merge: serializeMerge(existing, p.branchById), dedup: true }
+      if (existing) return { ok: true, merge: serializeMerge(existing, p.branchById), dedup: true, alreadyCommitted: true }
       const entries = diffEntries(p, deltaKeys)
       if (entries.length === 0) return { ok: false, code: 'no-effective-increment' }
       const io = await extractIo(entries, B.title)
       if (!io || (!io.propositions.length && !io.negativeConstraints.length && !io.openQuestions.length)) return { ok: false, code: 'no-effective-increment' }
       const mergeBaseKeys = p.dag.mergeBases(sourceHead, targetHead)
       const createdAt = Date.now()
-      const rec = {
-        schemaVersion: 2,
+      const merge = {
+        schemaVersion: 3,
         id: 'mg-' + Math.random().toString(36).slice(2, 12),
         workspaceKey: p.workspaceKey,
         sourceA: source,
         targetB: target,
         sourceHeadKey: sourceHead,
-        targetParentKey: targetHead || null,
-        headBeforeB: targetHead || null,
+        targetParentKey: targetHead,
+        headBeforeB: targetHead,
         parentKeys: [targetHead, sourceHead].filter(Boolean),
         mergeBaseKeys,
         lcaKey: mergeBaseKeys.length === 1 ? mergeBaseKeys[0] : null,
@@ -776,13 +887,90 @@ export function apply(ctx) {
         diffKeys: deltaKeys,
         diffTurns: entries.filter((entry) => entry.turn !== null).map((entry) => entry.turn),
       }
-      rec.key = 'mg:' + rec.id
-      merges.set(rec.id, rec)
-      if (mergeTable) { try { await mergeTable.put(rec.id, rec) } catch (e) { console.error('[git-graph] merge persist failed', e) } }
-      invalidateProject(callerSessionId)
-      const updated = await loadProject(callerSessionId)
-      return { ok: true, merge: serializeMerge(rec, updated.error ? p.branchById : updated.branchById) }
+      merge.key = 'mg:' + merge.id
+      const prepared = {
+        schemaVersion: 1,
+        id: 'pm-' + Math.random().toString(36).slice(2, 12),
+        idempotencyKey: typeof idempotencyKey === 'string' ? idempotencyKey : '',
+        workspaceKey: p.workspaceKey,
+        callerSessionId,
+        source,
+        target,
+        sourceHead,
+        targetHead,
+        merge,
+        state: 'prepared',
+        createdAt,
+        expiresAt: createdAt + 10 * 60 * 1000,
+      }
+      try { await persistPreparation(prepared) }
+      catch (e) { console.error('[git-graph] prepare persist failed', e); return { ok: false, code: 'persist-failed' } }
+      return { ok: true, preparation: prepared }
     })
+  }
+
+  async function commitPreparedFor(args, capability) {
+    if (capability !== coordinatorCapability) return { ok: false, code: 'coordinator-required' }
+    await domainReady
+    const preparationId = args && args.preparationId
+    const prepared = preparations.get(preparationId)
+    if (!prepared) return { ok: false, code: 'preparation-not-found' }
+    if (prepared.state === 'committed') return { ok: true, merge: prepared.committedMerge, dedup: true }
+    if (prepared.state !== 'prepared') return { ok: false, code: 'preparation-' + prepared.state }
+    if (prepared.expiresAt <= Date.now()) return { ok: false, code: 'preparation-expired' }
+    return await withMergeLock(prepared.workspaceKey + '|' + prepared.source + '|' + prepared.target, async () => {
+      if (prepared.state === 'committed') return { ok: true, merge: prepared.committedMerge, dedup: true }
+      if (prepared.state !== 'prepared') return { ok: false, code: 'preparation-' + prepared.state }
+      invalidateProject(prepared.callerSessionId)
+      const p = await loadProject(prepared.callerSessionId)
+      if (p.error) return { ok: false, code: p.error }
+      if ((p.dag.branchHeads.get(prepared.source) || null) !== prepared.sourceHead) return { ok: false, code: 'source-head-moved' }
+      if ((p.dag.branchHeads.get(prepared.target) || null) !== prepared.targetHead) return { ok: false, code: 'target-head-moved' }
+      const rec = prepared.merge
+      merges.set(rec.id, rec)
+      try {
+        if (mergeTable) await mergeTable.put(rec.id, rec)
+      } catch (e) {
+        merges.delete(rec.id)
+        console.error('[git-graph] prepared merge commit failed', e)
+        return { ok: false, code: 'persist-failed' }
+      }
+      invalidateProject(prepared.callerSessionId)
+      let updated = null
+      try { updated = await loadProject(prepared.callerSessionId) }
+      catch (e) { console.error('[git-graph] post-commit graph refresh failed', e) }
+      prepared.state = 'committed'
+      prepared.committedAt = Date.now()
+      prepared.committedMerge = serializeMerge(rec, updated && !updated.error ? updated.branchById : p.branchById)
+      try { await persistPreparation(prepared) }
+      catch (e) { console.error('[git-graph] preparation receipt persist failed after committed merge', e) }
+      return { ok: true, merge: prepared.committedMerge }
+    })
+  }
+
+  async function abortPreparedFor(args, capability) {
+    if (capability !== coordinatorCapability) return { ok: false, code: 'coordinator-required' }
+    await domainReady
+    const prepared = preparations.get(args && args.preparationId)
+    if (!prepared) return { ok: true, dedup: true }
+    if (prepared.state === 'committed') return { ok: false, code: 'already-committed' }
+    if (prepared.state === 'aborted') return { ok: true, dedup: true }
+    prepared.state = 'aborted'
+    prepared.abortedAt = Date.now()
+    if (prepared.idempotencyKey) preparationKeys.delete(prepared.idempotencyKey)
+    await persistPreparation(prepared)
+    if (prepared.idempotencyKey) preparationKeys.delete(prepared.idempotencyKey)
+    return { ok: true }
+  }
+
+  async function mergeFor(callerSessionId, source, target) {
+    const initial = await loadProject(callerSessionId)
+    if (initial.error) return { ok: false, code: initial.error }
+    const sourceHead = initial.dag.branchHeads.get(source) || null
+    const targetHead = initial.dag.branchHeads.get(target) || null
+    const prepared = await prepareMergeFor({ callerSessionId, source, target, idempotencyKey: 'direct:' + callerSessionId + ':' + source + ':' + target + ':' + sourceHead + ':' + targetHead })
+    if (!prepared.ok || prepared.alreadyCommitted) return prepared
+    return await commitPreparedFor({ preparationId: prepared.preparation.id }, coordinatorCapability)
   }
 
   async function scopedMerge(callerSessionId, mergeId) {
@@ -800,10 +988,12 @@ export function apply(ctx) {
     await loadProject(callerSessionId)
   }
 
-  async function revertFor(callerSessionId, mergeId) {
+  async function revertFor(callerSessionId, mergeId, capability) {
     const scoped = await scopedMerge(callerSessionId, mergeId)
     if (scoped.error) return { ok: false, code: scoped.error }
     const { p, m } = scoped
+    const denied = await mutationDenied('revert', callerSessionId, m.sourceA, m.targetB, mergeId, capability)
+    if (denied) return { ok: false, code: denied }
     if (m.revert && m.revert.id) return { ok: true, revert: m.revert, dedup: true }
     const parentKey = p.dag.branchHeads.get(m.targetB)
     const createdAt = Date.now()
@@ -816,6 +1006,39 @@ export function apply(ctx) {
     catch (e) { console.error('[git-graph] merge revert persist failed', e); return { ok: false, code: 'persist-failed' } }
     return { ok: true, revert: m.revert }
   }
+
+  // ---------- trusted extension seam ----------
+  const sessionGraphService = Object.freeze({
+    version: 1,
+    registerCoordinator(spec) {
+      if (!spec || typeof spec !== 'object') throw new Error('sessionGraph coordinator spec is required')
+      if (coordinator) throw new Error('sessionGraph coordinator already registered')
+      coordinator = Object.freeze({
+        resolveMembership: typeof spec.resolveMembership === 'function' ? spec.resolveMembership : null,
+        guardMutation: typeof spec.guardMutation === 'function' ? spec.guardMutation : null,
+      })
+      invalidateProject()
+      let active = true
+      const requireActive = () => {
+        if (!active) throw new Error('sessionGraph coordinator handle is disposed')
+      }
+      return Object.freeze({
+        async prepareMerge(args) { requireActive(); return await prepareMergeFor(args, coordinatorCapability) },
+        async commitMerge(args) { requireActive(); return await commitPreparedFor(args, coordinatorCapability) },
+        async abortMerge(args) { requireActive(); return await abortPreparedFor(args, coordinatorCapability) },
+        async revert(args) { requireActive(); return await revertFor(args && args.callerSessionId, args && args.mergeId, coordinatorCapability) },
+        async graph(sessionId) { requireActive(); return await buildGraph(sessionId) },
+        invalidate(sessionId) { requireActive(); invalidateProject(sessionId) },
+        release() {
+          if (!active) return
+          active = false
+          coordinator = null
+          invalidateProject()
+        },
+      })
+    },
+  })
+  if (typeof ctx.provide === 'function') ctx.provide('sessionGraph', sessionGraphService)
 
   async function injectFor(callerSessionId, mergeId) {
     const scoped = await scopedMerge(callerSessionId, mergeId)
@@ -891,7 +1114,7 @@ export function apply(ctx) {
     const purgeSummaries = !args || args.summaries !== false
     const purgeMerges = !args || args.merges !== false
     const purgeSettings = !!(args && args.settings)
-    const removed = { summaries: 0, merges: 0, settings: 0 }
+    const removed = { summaries: 0, merges: 0, preparations: 0, settings: 0 }
     try {
       if (purgeSummaries) {
         for (const [key, value] of [...summaries.entries()]) {
@@ -907,6 +1130,13 @@ export function apply(ctx) {
           merges.delete(m.id)
           await deleteStored(mergeTable, m.id)
           removed.merges++
+        }
+        for (const [id, prepared] of [...preparations.entries()]) {
+          if (!prepared || prepared.workspaceKey !== p.workspaceKey) continue
+          preparations.delete(id)
+          if (prepared.idempotencyKey) preparationKeys.delete(prepared.idempotencyKey)
+          await deleteStored(preparedTable, id)
+          removed.preparations++
         }
       }
       if (purgeSettings && settings.has(p.workspaceKey)) {

@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.7.0 - 2026-09-05
+
+- Add one trusted `sessionGraph` coordinator service for higher-level workflow plugins.
+- Support explicit logical-graph membership across physical worktree workspaces.
+- Add managed mutation guards without changing the existing HTTP or model-tool interfaces.
+- Add durable, idempotent prepare/commit/abort merge records with source/target expected-head fencing.
+- Add explicit graph-cache invalidation and coordinator teardown.
+
 ## 0.6.0 - 2026-09-05
 
 - Replace linear-prefix merge calculation with a two-parent session-information DAG and reachable-set difference.
