@@ -37,6 +37,12 @@ var CSS = `
 .sgx-btn:disabled{opacity:.5;cursor:default}
 .sgx-btn.sgx-main{border-color:var(--dsw-alias-brand-primary);color:var(--dsw-alias-brand-primary)}
 .sgx-net{flex:1;min-height:0;overflow:auto;overscroll-behavior:contain;touch-action:pan-y;padding:4px 2px}
+.sgx-canvas{position:relative;width:100%}
+.sgx-graph{position:absolute;left:0;top:0;overflow:visible}
+.sgx-labels{position:absolute;top:0;right:6px;min-width:0}
+.sgx-label{position:absolute;left:0;right:0;height:20px;box-sizing:border-box;border-radius:4px;padding:0 6px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;line-height:20px;color:var(--dsw-alias-label-secondary);cursor:pointer}
+.sgx-label:hover{background:var(--dsw-alias-bg-layer-1);color:var(--dsw-alias-label-primary)}
+.sgx-label.sgx-current{background:rgba(86,129,210,0.18);color:var(--dsw-alias-label-primary)}
 .sgx-detail{border-top:1px solid var(--dsw-alias-border-l1);padding:6px 8px;max-height:180px;overflow:auto;flex:none}
 .sgx-dk{display:inline-block;font-size:10px;line-height:14px;border-radius:4px;padding:0 5px;margin-right:5px;border:1px solid var(--dsw-alias-border-l2);color:var(--dsw-alias-label-secondary);vertical-align:middle}
 .sgx-dtitle{font-weight:600;margin:2px 0}
@@ -55,10 +61,55 @@ var LANE_W = 30
 var ROW_H = 24
 var PAD_X = 8
 var LABEL_H = 2
-var CONTENT_W = 230
 var TOP_PAD = 14
 var LANE_COLORS = ['#4f8ef7', '#39a97c', '#e3b341', '#b06fd8', '#e56a6a', '#50b8c0', '#f0885e', '#7f6be8']
 function laneColor(i) { return LANE_COLORS[i % LANE_COLORS.length] }
+var laneX = function (i) { return PAD_X + i * LANE_W + LANE_W / 2 }
+var rowY = function (i) { return TOP_PAD + LABEL_H + i * ROW_H + ROW_H / 2 + 4 }
+
+// One branch's lane line: the junction elbow (from the parent lane at the fork
+// row) plus the vertical run to the branch head. The root branch has no fork
+// row; it gets a straight trunk through its own commit block (oldest row ->
+// newest row), otherwise its commits render as unconnected dots whenever
+// child branches wedge between them.
+function lanePathFor(g, L) {
+  if (g.empty || g.headRow < 0) return null
+  var lx = laneX(g.lane)
+  var headY = rowY(g.headRow)
+  var parentLane = g.parentId !== null && L.laneOf[g.parentId] !== undefined ? L.laneOf[g.parentId] : null
+  if (g.forkRow >= 0) {
+    var ly = rowY(g.forkRow)
+    if (parentLane !== null) {
+      var px = laneX(parentLane)
+      return 'M ' + px + ' ' + ly + ' L ' + (lx - 5) + ' ' + ly + ' Q ' + lx + ' ' + ly + ' ' + lx + ' ' + (ly - 5) + ' L ' + lx + ' ' + headY
+    }
+    return 'M ' + lx + ' ' + ly + ' L ' + lx + ' ' + headY
+  }
+  if (g.tailRow >= 0 && g.tailRow !== g.headRow) return 'M ' + lx + ' ' + rowY(g.tailRow) + ' L ' + lx + ' ' + headY
+  return null
+}
+
+function compactUpwardSegment(from, to) {
+  if (from.x === to.x) return ' L ' + to.x + ' ' + to.y
+  var distance = Math.max(0, from.y - to.y)
+  var curveHeight = Math.min(ROW_H, distance)
+  if (curveHeight <= 0) return ' L ' + to.x + ' ' + to.y
+  var startY = to.y + curveHeight
+  var d = from.y > startY ? (' L ' + from.x + ' ' + startY) : ''
+  d += ' C ' + from.x + ' ' + (to.y + curveHeight * 0.68) + ', ' + to.x + ' ' + (to.y + curveHeight * 0.32) + ', ' + to.x + ' ' + to.y
+  return d
+}
+
+function compactForkSegment(from, to) {
+  if (from.x === to.x) return ' L ' + to.x + ' ' + to.y
+  var distance = Math.max(0, from.y - to.y)
+  var curveHeight = Math.min(ROW_H, distance)
+  if (curveHeight <= 0) return ' L ' + to.x + ' ' + to.y
+  var endY = from.y - curveHeight
+  var d = ' C ' + from.x + ' ' + (from.y - curveHeight * 0.32) + ', ' + to.x + ' ' + (from.y - curveHeight * 0.68) + ', ' + to.x + ' ' + endY
+  if (endY > to.y) d += ' L ' + to.x + ' ' + to.y
+  return d
+}
 
 function rootOf(branch, byId) {
   var b = branch
@@ -93,6 +144,113 @@ function groupTrees(data) {
   }
 }
 
+function orderBranchesForMerges(branches, merges) {
+  var baseIndex = {}
+  var byId = {}
+  var indegree = {}
+  var outgoing = {}
+  branches.forEach(function (b, i) {
+    baseIndex[b.id] = i
+    byId[b.id] = b
+    indegree[b.id] = 0
+    outgoing[b.id] = []
+  })
+  ;(merges || []).forEach(function (m) {
+    // Prefer a permanent lane order in which every source sits to the right
+    // of its target. Cyclic histories are handled per-node below.
+    if (!byId[m.targetB] || !byId[m.sourceA] || m.targetB === m.sourceA) return
+    if (outgoing[m.targetB].indexOf(m.sourceA) >= 0) return
+    outgoing[m.targetB].push(m.sourceA)
+    indegree[m.sourceA]++
+  })
+  var ready = branches.filter(function (b) { return indegree[b.id] === 0 })
+  ready.sort(function (a, b) { return baseIndex[a.id] - baseIndex[b.id] })
+  var result = []
+  while (ready.length) {
+    var current = ready.shift()
+    result.push(current)
+    outgoing[current.id].forEach(function (id) {
+      indegree[id]--
+      if (indegree[id] === 0) {
+        ready.push(byId[id])
+        ready.sort(function (a, b) { return baseIndex[a.id] - baseIndex[b.id] })
+      }
+    })
+  }
+  if (result.length < branches.length) {
+    branches.forEach(function (b) {
+      if (result.indexOf(b) < 0) result.push(b)
+    })
+  }
+  return result
+}
+
+function orderRowsForGraph(rows, commitMap, branchInfo, merges) {
+  var idOf = function (cell) { return cell.kind === 'tip' ? '__tip__' + cell.branchId : cell.key }
+  var byKey = {}
+  var originalIndex = {}
+  var indegree = {}
+  var outgoing = {}
+  rows.forEach(function (cell, i) {
+    var id = idOf(cell)
+    byKey[id] = cell
+    originalIndex[id] = i
+    indegree[id] = 0
+    outgoing[id] = []
+  })
+  var addBefore = function (newer, older) {
+    if (!byKey[newer] || !byKey[older] || newer === older) return
+    if (outgoing[newer].indexOf(older) >= 0) return
+    outgoing[newer].push(older)
+    indegree[older]++
+  }
+  for (var branchId in branchInfo) {
+    var info = branchInfo[branchId]
+    var newestFirst = info.ownKeys.slice().reverse()
+    for (var i = 0; i + 1 < newestFirst.length; i++) addBefore(newestFirst[i], newestFirst[i + 1])
+    if (newestFirst.length && info.forkKey && newestFirst[newestFirst.length - 1] !== info.forkKey) {
+      addBefore(newestFirst[newestFirst.length - 1], info.forkKey)
+    }
+    if (info.empty && info.forkKey) addBefore('__tip__' + branchId, info.forkKey)
+  }
+  ;(merges || []).forEach(function (m) {
+    addBefore(m.key, m.targetParentKey || m.headBeforeB)
+    addBefore(m.key, m.sourceHeadKey)
+    if (m.revert && m.revert.key) addBefore(m.revert.key, m.revert.parentKey || m.key)
+  })
+  var timeOf = function (id) {
+    var cell = byKey[id]
+    if (!cell) return 0
+    if (cell.kind === 'commit') return (commitMap[cell.key] && commitMap[cell.key].time) || 0
+    if (cell.kind === 'tip') return (commitMap[branchInfo[cell.branchId].forkKey] && commitMap[branchInfo[cell.branchId].forkKey].time + 0.5) || 0
+    return cell.time || 0
+  }
+  var ready = Object.keys(byKey).filter(function (id) { return indegree[id] === 0 })
+  var sortReady = function () {
+    ready.sort(function (a, b) { return (timeOf(b) - timeOf(a)) || (originalIndex[a] - originalIndex[b]) })
+  }
+  sortReady()
+  var ordered = []
+  var emitted = {}
+  while (ready.length) {
+    var id = ready.shift()
+    emitted[id] = true
+    ordered.push(byKey[id])
+    outgoing[id].forEach(function (next) {
+      indegree[next]--
+      if (indegree[next] === 0) ready.push(next)
+    })
+    sortReady()
+  }
+  if (ordered.length < rows.length) {
+    rows.forEach(function (cell) {
+      var id = idOf(cell)
+      if (!emitted[id]) ordered.push(cell)
+    })
+  }
+  return ordered
+}
+
 function layoutTree(data, treeId) {
   var g = groupTrees(data)
   var branchIds = []
@@ -105,13 +263,15 @@ function layoutTree(data, treeId) {
     while (p && byId[p] && hops < 64) { d++; p = byId[p].parentId; hops++ }
     return d
   }
-  var ordered = branchIds.map(function (id) { return byId[id] }).sort(function (a, b) {
+  var baseOrdered = branchIds.map(function (id) { return byId[id] }).sort(function (a, b) {
     // 自适应 lane：有提交的分支靠左（贴近主干），空分支 tip 靠右，
     // 避免空 lane 夹在中间造成"未连接"的观感。
     var ea = (a.commitCount || 0) > 0 ? 0 : 1
     var eb = (b.commitCount || 0) > 0 ? 0 : 1
     return (ea - eb) || (depthOf(a.id) - depthOf(b.id)) || (a.createdAt - b.createdAt) || 0
   })
+  var merges = (data && data.merges) || []
+  var ordered = orderBranchesForMerges(baseOrdered, merges)
   var laneOf = {}
   ordered.forEach(function (b, i) { laneOf[b.id] = i })
 
@@ -124,10 +284,50 @@ function layoutTree(data, treeId) {
     var chain = b.chain || []
     var own = b.commitCount || 0
     var ownKeys = own > 0 ? chain.slice(chain.length - own) : []
+    branchInfo[b.id] = { ownKeys: ownKeys.slice(), forkKey: null, empty: own === 0, own: own }
+  })
+
+  // Fork point: normally the last shared ancestor in `chain`. A fork created
+  // with zero inherited commits (e.g. a native subagent whose seedLength is 0)
+  // carries NO shared ancestor, so `chain.length <= own`; that branch's fork
+  // point cannot come from its own chain and must be derived from the parent
+  // branch — the parent commit that immediately precedes the child's first own
+  // commit. Without this, the branch is treated as forking from itself.
+  function deriveForkKey(branchId) {
+    var b = byId[branchId]
+    if (!b || !b.parentId) return null
+    var info = branchInfo[branchId]
+    if (!info) return null
+    var refTime = -1
+    if (info.own > 0) {
+      var ownC = info.ownKeys.map(function (k) { return commitMap[k] }).filter(Boolean)
+      ownC.sort(function (x, y) { return (x.time - y.time) || (x.endSeq - y.endSeq) })
+      if (ownC.length) { refTime = ownC[0].time }
+    } else {
+      refTime = Number(b.createdAt) || 0
+    }
+    var parent = byId[b.parentId]
+    var pInfo = parent ? branchInfo[parent.id] : null
+    if (!pInfo) return null
+    var cand = pInfo.ownKeys.map(function (k) { return commitMap[k] }).filter(Boolean)
+    var best = null
+    cand.forEach(function (c) {
+      if (c.time <= refTime && (!best || (c.time > best.time) || (c.time === best.time && c.endSeq > best.endSeq))) best = c
+    })
+    if (!best && cand.length) {
+      cand.sort(function (x, y) { return (x.time - y.time) || (x.endSeq - y.endSeq) })
+      best = cand[0]
+    }
+    return best ? best.key : null
+  }
+  ordered.forEach(function (b) {
+    var chain = b.chain || []
+    var info = branchInfo[b.id]
     var forkKey = null
-    if (own > 0) forkKey = chain.length > own ? chain[chain.length - own - 1] : ownKeys[0]
-    else forkKey = chain.length > 0 ? chain[chain.length - 1] : null
-    branchInfo[b.id] = { ownKeys: ownKeys.slice(), forkKey: forkKey, empty: own === 0 }
+    if (info.own > 0 && chain.length > info.own) forkKey = chain[chain.length - info.own - 1]
+    else if (info.own === 0 && chain.length > 0) forkKey = chain[chain.length - 1]
+    else forkKey = deriveForkKey(b.id)
+    info.forkKey = forkKey
   })
 
   // Row construction: one CELL per element. The root's native commits seed
@@ -186,7 +386,6 @@ function layoutTree(data, treeId) {
   // DAG operation cells: place merge/revert directly above their persisted
   // target parent. Processing oldest-first makes repeated merges and Git
   // reverts become a real causal chain rather than decorative rows.
-  var merges = (data && data.merges) || []
   var mergeRows = []
   var revertRows = []
   var operations = []
@@ -203,6 +402,12 @@ function layoutTree(data, treeId) {
     if (op.kind === 'merge') mergeRows.push({ key: op.key, merge: op.merge })
     else revertRows.push({ key: op.key, merge: op.merge, revert: op.revert })
   })
+  rows = orderRowsForGraph(rows, commitMap, branchInfo, merges)
+  rowIndex = {}
+  rows.forEach(function (cell, row) {
+    if (cell.kind !== 'tip') rowIndex[cell.key] = row
+  })
+  rowOf = rowIndex
   mergeRows.forEach(function (mr) {
     for (var r2 = 0; r2 < rows.length; r2++) {
       if (rows[r2].kind === 'merge' && rows[r2].key === mr.key) { mr.row = r2; break }
@@ -232,6 +437,11 @@ function layoutTree(data, treeId) {
       return (cc.time - ca.time) || (cc.endSeq - ca.endSeq)
     })[0] : null
     var headRow = headKey !== null && rowOf[headKey] !== undefined ? rowOf[headKey] : -1
+    var tailRow = -1
+    for (var oi0 = 0; oi0 < info.ownKeys.length; oi0++) {
+      var or0 = rowOf[info.ownKeys[oi0]]
+      if (or0 !== undefined && or0 > tailRow) tailRow = or0
+    }
     var tipRow = -1
     if (info.empty) {
       for (var r2 = 0; r2 < rows.length; r2++) {
@@ -249,6 +459,7 @@ function layoutTree(data, treeId) {
       forkKey: info.forkKey,
       forkRow: forkRow,
       headRow: headRow,
+      tailRow: tailRow,
       tipRow: tipRow,
     })
   })
@@ -266,6 +477,28 @@ function layoutTree(data, treeId) {
     lanes: ordered.length,
     rowCount: rows.length,
   }
+}
+
+function visualLanesFor(layout) {
+  var nodeLane = {}
+  layout.rows.forEach(function (cell) {
+    if (cell.kind === 'commit') {
+      var commit = layout.commitMap[cell.key]
+      if (commit && layout.laneOf[commit.sessionId] !== undefined) nodeLane[cell.key] = layout.laneOf[commit.sessionId]
+    } else if (cell.kind === 'tip') {
+      nodeLane['__tip__' + cell.branchId] = layout.laneOf[cell.branchId]
+    } else if (cell.kind === 'merge' || cell.kind === 'revert') {
+      nodeLane[cell.key] = layout.laneOf[cell.targetB]
+    }
+  })
+  layout.mergeRows.forEach(function (mr) {
+    var sourceKey = mr.merge.sourceHeadKey
+    if (sourceKey === undefined || nodeLane[sourceKey] === undefined || mr.targetLane === undefined) return
+    nodeLane[sourceKey] = Math.max(nodeLane[sourceKey], mr.targetLane + 1)
+  })
+  var laneCount = layout.lanes
+  for (var key in nodeLane) laneCount = Math.max(laneCount, nodeLane[key] + 1)
+  return { nodeLane: nodeLane, lanes: laneCount }
 }
 
 var inject = ['slots', 'sessions', 'timer', 'betterSidebar']
@@ -396,7 +629,8 @@ function apply(ctx) {
       activeTree = curTree
     }
     var L = activeTree ? layoutTree(data, activeTree) : null
-    var lanes = L ? L.lanes : 0
+    var visual = L ? visualLanesFor(L) : { nodeLane: {}, lanes: 0 }
+    var lanes = visual.lanes
     var rowCount = L ? L.rowCount : 0
 
     // 当前会话所处提交 = 自身分支最新的 native commit（空分支则为 tip）
@@ -416,11 +650,10 @@ function apply(ctx) {
         break
       }
     }
-    var width = PAD_X * 2 + lanes * LANE_W + CONTENT_W
     var laneEndX = PAD_X + lanes * LANE_W
+    var graphWidth = laneEndX + PAD_X
+    var canvasMinWidth = laneEndX + 96
     var height = TOP_PAD + LABEL_H + rowCount * ROW_H + PAD_X + 6
-    var laneX = function (i) { return PAD_X + i * LANE_W + LANE_W / 2 }
-    var rowY = function (i) { return TOP_PAD + LABEL_H + i * ROW_H + ROW_H / 2 + 4 }
 
     // jump into another session, keeping the Git 图谱 card open there.
     // url seed = CONTENT open => the panel is expanded automatically if collapsed.
@@ -471,85 +704,89 @@ function apply(ctx) {
     }
 
     // ---------- svg children (one CELL per element) ----------
-    var lanePaths = []
+    var branchPaths = []
     var commitGroups = []
     var tipGroups = []
     var mergePaths = []
     var mergeGroups = []
     var revertPaths = []
     var revertGroups = []
+    var labels = []
+    var addLabel = function (key, row, text, current, onClick) {
+      labels.push(React.createElement('div', {
+        key: 'label-' + key,
+        className: 'sgx-label' + (current ? ' sgx-current' : ''),
+        style: { top: (rowY(row) - 10) + 'px' },
+        title: text,
+        onClick: onClick,
+      }, text))
+    }
 
-    // lane lines: junction (fork point, shared with the parent) -> head
+    // Rails follow the visual position of every node. A source commit can
+    // temporarily move right for a merge without changing its branch identity.
     L.geom.forEach(function (g) {
-      if (g.empty || g.forkRow < 0 || g.headRow < 0) return
-      var lx = laneX(g.lane)
-      var ly = rowY(g.forkRow)
-      var headY = rowY(g.headRow)
+      var points = []
       var color = laneColor(g.lane)
-      var parentLane = g.parentId !== null && L.laneOf[g.parentId] !== undefined ? L.laneOf[g.parentId] : null
-      var d
-      if (parentLane !== null) {
-        var px = laneX(parentLane)
-        d = 'M ' + px + ' ' + ly + ' L ' + (lx - 5) + ' ' + ly + ' Q ' + lx + ' ' + ly + ' ' + lx + ' ' + (ly - 5) + ' L ' + lx + ' ' + headY
-      } else {
-        d = 'M ' + lx + ' ' + ly + ' L ' + lx + ' ' + headY
+      if (g.forkRow >= 0) {
+        var anchorLane = visual.nodeLane[g.forkKey]
+        if (anchorLane === undefined) anchorLane = g.parentId !== null ? L.laneOf[g.parentId] : g.lane
+        points.push({ x: laneX(anchorLane), y: rowY(g.forkRow) })
       }
-      lanePaths.push({ d: d, color: color })
-    })
-    // empty branches: junction elbow + stub up to the tip cell
-    L.geom.forEach(function (g) {
-      if (!g.empty || g.forkRow < 0 || g.tipRow < 0) return
-      var lx = laneX(g.lane)
-      var ly = rowY(g.forkRow)
-      var ty = rowY(g.tipRow)
-      var color = laneColor(g.lane)
-      var parentLane = g.parentId !== null && L.laneOf[g.parentId] !== undefined ? L.laneOf[g.parentId] : null
-      var d = null
-      if (parentLane !== null) {
-        var px = laneX(parentLane)
-        d = 'M ' + px + ' ' + ly + ' L ' + (lx - 5) + ' ' + ly + ' Q ' + lx + ' ' + ly + ' ' + lx + ' ' + (ly - 5) + ' L ' + lx + ' ' + ty
+      for (var ri = L.rows.length - 1; ri >= 0; ri--) {
+        var cell = L.rows[ri]
+        var belongs = false
+        var nodeKey = cell.key
+        if (cell.kind === 'commit') belongs = L.commitMap[cell.key] && L.commitMap[cell.key].sessionId === g.id
+        else if (cell.kind === 'tip') { belongs = cell.branchId === g.id; nodeKey = '__tip__' + cell.branchId }
+        else belongs = cell.targetB === g.id
+        if (!belongs) continue
+        var nodeLane = visual.nodeLane[nodeKey]
+        if (nodeLane === undefined) nodeLane = g.lane
+        var point = { x: laneX(nodeLane), y: rowY(ri) }
+        if (points.length && points[points.length - 1].y === point.y) points[points.length - 1] = point
+        else points.push(point)
       }
-      if (d) lanePaths.push({ d: d, color: color })
+      if (points.length < 2) return
+      var d = 'M ' + points[0].x + ' ' + points[0].y
+      for (var pi = 1; pi < points.length; pi++) {
+        var from = points[pi - 1]
+        var to = points[pi]
+        d += (pi === 1 && g.parentId !== null) ? compactForkSegment(from, to) : compactUpwardSegment(from, to)
+      }
+      branchPaths.push({ d: d, color: color })
     })
 
-    // merge edges + merge nodes (source head S-curve into B's lane)
+    // The solid source rail always flows from lower-right into upper-left;
+    // its bend alone conveys which branch was merged into which target.
     L.mergeRows.forEach(function (mr) {
-      var bx = laneX(mr.targetLane)
+      var bx = laneX(visual.nodeLane[mr.key] !== undefined ? visual.nodeLane[mr.key] : mr.targetLane)
       var my = rowY(mr.row)
       var bColor = laneColor(mr.targetLane)
       var sColor = laneColor(mr.sourceLane !== undefined ? mr.sourceLane : 0)
       var isCurrentMerge = curInfo && curInfo.headKey === mr.key
-      if (mr.headBeforeRow >= 0) {
-        mergePaths.push({ d: 'M ' + bx + ' ' + rowY(mr.headBeforeRow) + ' L ' + bx + ' ' + my, color: bColor, dashed: false })
-      }
       if (mr.sourceRow >= 0) {
-        var sx = laneX(mr.sourceLane)
+        var sx = laneX(visual.nodeLane[mr.merge.sourceHeadKey] !== undefined ? visual.nodeLane[mr.merge.sourceHeadKey] : mr.sourceLane)
         var sy = rowY(mr.sourceRow)
-        var dir1 = sy < my ? 1 : -1
-        var mEndY = dir1 > 0 ? my - 5.5 : my + 5.5
-        mergePaths.push({ d: 'M ' + sx + ' ' + sy + ' C ' + sx + ' ' + mEndY + ', ' + bx + ' ' + sy + ', ' + bx + ' ' + mEndY, color: sColor, dashed: true })
-        // 方向箭头：源分支 S 曲线末端汇入 merge 方块（源色实心三角，朝向随源位置自适应）
-        mergePaths.push({ kind: 'arrow', x: bx, y: my, dir: dir1, color: sColor })
+        mergePaths.push({ d: 'M ' + sx + ' ' + sy + compactUpwardSegment({ x: sx, y: sy }, { x: bx, y: my }), color: sColor })
       }
       mergeGroups.push(React.createElement('g', { key: mr.key, className: 'sgx-mg', opacity: mr.merge.status === 'reverted' ? 0.55 : 1, style: { cursor: 'pointer' }, onClick: function () { setSelKey(mr.key) } },
         React.createElement('circle', { cx: bx, cy: my, r: 9, fill: 'transparent' }),
         (selKey === mr.key) && React.createElement('circle', { cx: bx, cy: my, r: 9, fill: 'none', stroke: 'var(--dsw-alias-brand-primary)', strokeWidth: 2 }),
         isCurrentMerge && React.createElement('circle', { cx: bx, cy: my, r: 9, fill: 'none', stroke: bColor, strokeWidth: 2 }),
-        React.createElement('rect', { x: bx - 4.5, y: my - 4.5, width: 9, height: 9, rx: 2, fill: bColor, stroke: 'var(--dsw-alias-bg-overlay)', strokeWidth: 1 }),
-        React.createElement('text', { x: laneEndX + 10, y: my + 4, fontSize: 11.5, fill: 'var(--dsw-alias-label-secondary)', style: { cursor: 'pointer' } }, truncate((mr.merge.status === 'reverted' ? '已撤销 · ' : '') + (mr.merge.title || '合并'), 30))))
+        React.createElement('rect', { x: bx - 4.5, y: my - 4.5, width: 9, height: 9, rx: 2, fill: bColor, stroke: 'var(--dsw-alias-bg-overlay)', strokeWidth: 1 })))
+      addLabel(mr.key, mr.row, (mr.merge.status === 'reverted' ? '已撤销 · ' : '') + (mr.merge.title || '合并'), isCurrentMerge, function () { setSelKey(mr.key) })
     })
 
     L.revertRows.forEach(function (rr) {
       if (rr.row < 0) return
-      var rx = laneX(rr.targetLane)
+      var rx = laneX(visual.nodeLane[rr.key] !== undefined ? visual.nodeLane[rr.key] : rr.targetLane)
       var ry = rowY(rr.row)
       var isCurrentRevert = curInfo && curInfo.headKey === rr.key
-      if (rr.parentRow >= 0) revertPaths.push({ d: 'M ' + rx + ' ' + rowY(rr.parentRow) + ' L ' + rx + ' ' + ry })
       revertGroups.push(React.createElement('g', { key: rr.key, className: 'sgx-rv', style: { cursor: 'pointer' }, onClick: function () { setSelKey(rr.key) } },
         React.createElement('circle', { cx: rx, cy: ry, r: 10, fill: 'transparent' }),
         (selKey === rr.key || isCurrentRevert) && React.createElement('circle', { cx: rx, cy: ry, r: 9, fill: 'none', stroke: 'var(--dsw-alias-state-error-primary)', strokeWidth: 2 }),
-        React.createElement('polygon', { points: rx + ',' + (ry - 5.5) + ' ' + (rx + 5.5) + ',' + ry + ' ' + rx + ',' + (ry + 5.5) + ' ' + (rx - 5.5) + ',' + ry, fill: 'var(--dsw-alias-state-error-primary)', stroke: 'var(--dsw-alias-bg-overlay)', strokeWidth: 1 }),
-        React.createElement('text', { x: laneEndX + 10, y: ry + 4, fontSize: 11.5, fill: 'var(--dsw-alias-label-secondary)', style: { cursor: 'pointer' } }, 'Git revert · ' + truncate(rr.merge.title || rr.merge.id, 22))))
+        React.createElement('polygon', { points: rx + ',' + (ry - 5.5) + ' ' + (rx + 5.5) + ',' + ry + ' ' + rx + ',' + (ry + 5.5) + ' ' + (rx - 5.5) + ',' + ry, fill: 'var(--dsw-alias-state-error-primary)', stroke: 'var(--dsw-alias-bg-overlay)', strokeWidth: 1 })))
+      addLabel(rr.key, rr.row, 'Git revert · ' + (rr.merge.title || rr.merge.id), isCurrentRevert, function () { setSelKey(rr.key) })
     })
 
     L.rows.forEach(function (cell, ri) {
@@ -560,34 +797,32 @@ function apply(ctx) {
         if (!c) return
         var ownerLane = L.laneOf[c.sessionId]
         if (ownerLane === undefined) return
-        var dx = laneX(ownerLane)
+        var dx = laneX(visual.nodeLane[k] !== undefined ? visual.nodeLane[k] : ownerLane)
         var dcolor = laneColor(ownerLane)
         var selected = selKey === k
         var isCur = curInfo && curInfo.headKey === k
         commitGroups.push(React.createElement('g', { key: k, className: 'sgx-cg', style: { cursor: 'pointer' }, onClick: function () { setSelKey(k) } },
           React.createElement('circle', { cx: dx, cy: y, r: 8, fill: 'transparent' }),
-          isCur && React.createElement('rect', { x: laneEndX + 4, y: y - 10, width: CONTENT_W - 8, height: 20, rx: 5, fill: 'rgba(86,129,210,0.18)' }),
           selected && React.createElement('circle', { cx: dx, cy: y, r: 8, fill: 'none', stroke: 'var(--dsw-alias-brand-primary)', strokeWidth: 2 }),
           isCur && React.createElement('circle', { cx: dx, cy: y, r: 8, fill: 'none', stroke: dcolor, strokeWidth: 2 }),
-          React.createElement('circle', { cx: dx, cy: y, r: 4.5, fill: dcolor, stroke: 'var(--dsw-alias-bg-overlay)', strokeWidth: 1 }),
-          React.createElement('text', { x: laneEndX + 10, y: y + 4, fontSize: 11.5, fill: isCur ? 'var(--dsw-alias-label-primary)' : 'var(--dsw-alias-label-secondary)', style: { cursor: 'pointer' } }, truncate(c.title, 30))))
+          React.createElement('circle', { cx: dx, cy: y, r: 4.5, fill: dcolor, stroke: 'var(--dsw-alias-bg-overlay)', strokeWidth: 1 })))
+        addLabel(k, ri, c.title || ('# ' + c.turn), isCur, function () { setSelKey(k) })
       } else if (cell.kind === 'tip') {
         var g = null
         for (var ti = 0; ti < L.geom.length; ti++) if (L.geom[ti].id === cell.branchId) { g = L.geom[ti]; break }
         if (!g) return
-        var lx2 = laneX(g.lane)
-        var color2 = laneColor(g.lane)
         var tipKey2 = '__tip__' + g.id
+        var lx2 = laneX(visual.nodeLane[tipKey2] !== undefined ? visual.nodeLane[tipKey2] : g.lane)
+        var color2 = laneColor(g.lane)
         var forkCommit = g.forkKey ? L.commitMap[g.forkKey] : null
         var sel2 = selKey === tipKey2
         var isCurTip = curInfo && curInfo.empty && g.id === curInfo.branchId
         tipGroups.push(React.createElement('g', { key: tipKey2, className: 'sgx-tip', style: { cursor: 'pointer' }, onClick: function () { setSelKey(tipKey2) } },
           React.createElement('circle', { cx: lx2, cy: y, r: 8, fill: 'transparent' }),
-          isCurTip && React.createElement('rect', { x: laneEndX + 4, y: y - 10, width: CONTENT_W - 8, height: 20, rx: 5, fill: 'rgba(86,129,210,0.18)' }),
           React.createElement('circle', { cx: lx2, cy: y, r: 5, fill: 'none', stroke: color2, strokeWidth: isCurTip ? 2.5 : 2 }),
           sel2 && React.createElement('circle', { cx: lx2, cy: y, r: 8, fill: 'none', stroke: 'var(--dsw-alias-brand-primary)', strokeWidth: 2 }),
-          React.createElement('circle', { cx: lx2, cy: y, r: 1.8, fill: color2 }),
-          forkCommit && React.createElement('text', { x: laneEndX + 10, y: y + 4, fontSize: 11.5, fill: isCurTip ? 'var(--dsw-alias-label-primary)' : 'var(--dsw-alias-label-secondary)', style: { cursor: 'pointer' } }, '新分支 · ' + truncate(g.title, 24))))
+          React.createElement('circle', { cx: lx2, cy: y, r: 1.8, fill: color2 })))
+        if (forkCommit) addLabel(tipKey2, ri, '新分支 · ' + g.title, isCurTip, function () { setSelKey(tipKey2) })
       }
     })
 
@@ -754,23 +989,18 @@ function apply(ctx) {
           React.createElement('span', { className: 'sgx-ttext' }, t.rootTitle))
       })),
       React.createElement('div', { className: 'sgx-net' },
-        React.createElement('svg', { width: width, height: height, viewBox: '0 0 ' + width + ' ' + height },
-          lanePaths.map(function (lp, i) { return React.createElement('path', { key: 'lp' + i, d: lp.d, fill: 'none', stroke: lp.color, strokeWidth: 2, opacity: 0.9 }) }),
-          mergePaths.map(function (mp, i) {
-            if (mp.kind === 'arrow') {
-              var a1 = mp.dir > 0 ? mp.y - 12 : mp.y + 12
-              var a2 = mp.dir > 0 ? mp.y - 4.2 : mp.y + 4.2
-              return React.createElement('polygon', { key: 'mp' + i, points: (mp.x - 3.4) + ',' + a1 + ' ' + (mp.x + 3.4) + ',' + a1 + ' ' + mp.x + ',' + a2, fill: mp.color, opacity: 0.95 })
-            }
-            return React.createElement('path', { key: 'mp' + i, d: mp.d, fill: 'none', stroke: mp.color, strokeWidth: mp.dashed ? 1.5 : 2, strokeDasharray: mp.dashed ? '3 3' : undefined, opacity: 0.9 })
-          }),
-          revertPaths.map(function (rp, i) { return React.createElement('path', { key: 'rp' + i, d: rp.d, fill: 'none', stroke: 'var(--dsw-alias-state-error-primary)', strokeWidth: 1.5, opacity: 0.85 }) }),
-          tipGroups,
-          mergeGroups,
-          revertGroups,
-          commitGroups)),
+        React.createElement('div', { className: 'sgx-canvas', style: { height: height + 'px', minWidth: canvasMinWidth + 'px' } },
+          React.createElement('svg', { className: 'sgx-graph', width: graphWidth, height: height, viewBox: '0 0 ' + graphWidth + ' ' + height, 'aria-hidden': true },
+            branchPaths.map(function (lp, i) { return React.createElement('path', { key: 'lp' + i, d: lp.d, fill: 'none', stroke: lp.color, strokeWidth: 2, strokeLinecap: 'round', strokeLinejoin: 'round', opacity: 0.9 }) }),
+            mergePaths.map(function (mp, i) { return React.createElement('path', { key: 'mp' + i, d: mp.d, fill: 'none', stroke: mp.color, strokeWidth: 2, strokeLinecap: 'round', opacity: 0.95 }) }),
+            revertPaths.map(function (rp, i) { return React.createElement('path', { key: 'rp' + i, d: rp.d, fill: 'none', stroke: 'var(--dsw-alias-state-error-primary)', strokeWidth: 1.5, opacity: 0.85 }) }),
+            tipGroups,
+            mergeGroups,
+            revertGroups,
+            commitGroups),
+          React.createElement('div', { className: 'sgx-labels', style: { left: (laneEndX + 6) + 'px', height: height + 'px' } }, labels))),
       detail,
-      React.createElement('div', { className: 'sgx-note' }, '点击节点显示详情（checkout 进入该节点会话位置）；分叉与原分支共享分叉前最后一个提交，最新提交在顶部；方形节点=合入，菱形节点=Git revert，虚线箭头=合入方向，圆环=当前会话所处提交。动态注入不改写聊天历史，模型可用 session_graph_view / session_graph_read 溯源原文。'))
+      React.createElement('div', { className: 'sgx-note' }, '点击节点显示详情（checkout 进入该节点会话位置）；分叉与原分支共享分叉前最后一个提交，最新提交在顶部；方形节点=合入，菱形节点=Git revert，向左上弯入的实线=合入方向，圆环=当前会话所处提交。动态注入不改写聊天历史，模型可用 session_graph_view / session_graph_read 溯源原文。'))
   }
 
   // ------------------------------------------------------------------
@@ -860,7 +1090,16 @@ function apply(ctx) {
 
 exports.inject = inject
 exports.apply = apply
-exports.__test = { groupTrees: groupTrees, layoutTree: layoutTree }
+exports.__test = {
+  groupTrees: groupTrees,
+  layoutTree: layoutTree,
+  lanePathFor: lanePathFor,
+  compactUpwardSegment: compactUpwardSegment,
+  compactForkSegment: compactForkSegment,
+  orderBranchesForMerges: orderBranchesForMerges,
+  orderRowsForGraph: orderRowsForGraph,
+  visualLanesFor: visualLanesFor,
+}
 
     return module.exports;
   }
